@@ -3,7 +3,7 @@
 import os
 import tempfile
 import pytest
-from engram.store import MemoryStore
+from engram.store import MemoryStore, RecallResult, model_family
 
 
 @pytest.fixture
@@ -16,8 +16,11 @@ def store():
     os.unlink(path)
 
 
+# ── Basic CRUD ──────────────────────────────────────────────────
+
+
 def test_remember_and_recall(store):
-    m = store.remember("TrueNAS is at 192.168.0.192", category="network", key="truenas_ip")
+    m = store.remember("TrueNAS is at 192.168.0.192", category="network", key="truenas_ip", model="claude-opus-4-6")
     assert m.id
     assert m.content == "TrueNAS is at 192.168.0.192"
     assert m.category == "network"
@@ -27,40 +30,58 @@ def test_remember_and_recall(store):
     assert any("192.168.0.192" in r.content for r in results)
 
 
-def test_fact_deduplication(store):
-    store.remember("NAS is at .192", category="network", key="nas_ip")
-    store.remember("NAS is at .193", category="network", key="nas_ip")
+def test_fact_deduplication_same_model(store):
+    """Same model writing same category+key = upsert."""
+    store.remember("NAS is at .192", category="network", key="nas_ip", model="claude-opus-4-6")
+    store.remember("NAS is at .193", category="network", key="nas_ip", model="claude-opus-4-6")
 
     results = store.recall("NAS", category="network")
-    assert len(results) == 1
-    assert ".193" in results[0].content  # updated value
+    # Only one memory from the same model
+    claude_results = [r for r in results if r.model == "claude-opus-4-6"]
+    assert len(claude_results) == 1
+    assert ".193" in claude_results[0].content  # updated value
+
+
+def test_cross_model_isolation(store):
+    """Two models writing same category+key creates two separate rows."""
+    m1 = store.remember("Best approach is X", category="decisions", key="approach", model="claude-opus-4-6")
+    m2 = store.remember("Best approach is Y", category="decisions", key="approach", model="qwen3:32b")
+
+    # Both should exist as separate memories
+    assert m1.id != m2.id
+
+    results = store.recall("approach", category="decisions")
+    assert len(results) == 2
+    contents = [r.content for r in results]
+    assert any("X" in c for c in contents)
+    assert any("Y" in c for c in contents)
 
 
 def test_episode_no_dedup(store):
-    store.remember("Debugged timing chain issue", memory_type="episode", category="debug")
-    store.remember("Fixed NAS mount timeout", memory_type="episode", category="debug")
+    store.remember("Debugged timing chain issue", memory_type="episode", category="debug", model="claude-opus-4-6")
+    store.remember("Fixed NAS mount timeout", memory_type="episode", category="debug", model="claude-opus-4-6")
 
     results = store.recall("debug", category="debug")
     assert len(results) == 2
 
 
 def test_forget_by_id(store):
-    m = store.remember("temporary note", category="temp", key="note1")
-    assert store.forget(m.id)
+    m = store.remember("temporary note", category="temp", key="note1", model="claude-opus-4-6")
+    assert store.forget(m.id, model="claude-opus-4-6")
     results = store.recall("temporary note")
     assert len(results) == 0
 
 
 def test_forget_by_key(store):
-    store.remember("old fact", category="test", key="deleteme")
-    assert store.forget_by_key("test", "deleteme")
+    store.remember("old fact", category="test", key="deleteme", model="claude-opus-4-6")
+    assert store.forget_by_key("test", "deleteme", model="claude-opus-4-6")
     results = store.recall("old fact")
     assert len(results) == 0
 
 
 def test_update(store):
-    m = store.remember("initial value", category="test", key="updatable")
-    updated = store.update(m.id, content="new value", tags=["updated"])
+    m = store.remember("initial value", category="test", key="updatable", model="claude-opus-4-6")
+    updated = store.update(m.id, content="new value", tags=["updated"], model="claude-opus-4-6")
     assert updated.content == "new value"
     assert "updated" in updated.tags
 
@@ -86,23 +107,25 @@ def test_relationship_upsert(store):
 
 
 def test_categories(store):
-    store.remember("fact 1", category="network", key="k1")
-    store.remember("fact 2", category="network", key="k2")
-    store.remember("pref 1", memory_type="preference", category="user")
+    store.remember("fact 1", category="network", key="k1", model="claude-opus-4-6")
+    store.remember("fact 2", category="network", key="k2", model="claude-opus-4-6")
+    store.remember("pref 1", memory_type="preference", category="user", model="claude-opus-4-6")
 
     cats = store.list_categories()
     assert len(cats) >= 2
 
 
 def test_stats(store):
-    store.remember("test", category="test", key="t1")
+    store.remember("test", category="test", key="t1", model="claude-opus-4-6")
     s = store.stats()
     assert s["total_memories"] == 1
     assert s["by_type"]["fact"] == 1
+    assert "by_model" in s
+    assert s["by_model"]["claude-opus-4-6"] == 1
 
 
 def test_stale_detection(store):
-    m = store.remember("old memory", category="test", key="old")
+    m = store.remember("old memory", category="test", key="old", model="claude-opus-4-6")
     # Manually age it
     store._conn.execute(
         "UPDATE memories SET accessed_at = datetime('now', '-60 days') WHERE id = ?",
@@ -116,8 +139,8 @@ def test_stale_detection(store):
 
 
 def test_tags_filter(store):
-    store.remember("tagged memory", category="test", key="tagged", tags=["important", "network"])
-    store.remember("untagged memory", category="test", key="untagged")
+    store.remember("tagged memory", category="test", key="tagged", tags=["important", "network"], model="claude-opus-4-6")
+    store.remember("untagged memory", category="test", key="untagged", model="claude-opus-4-6")
 
     results = store.recall("memory", tags=["important"])
     assert len(results) == 1
@@ -125,16 +148,16 @@ def test_tags_filter(store):
 
 
 def test_confidence_filter(store):
-    store.remember("sure thing", category="test", key="sure", confidence=1.0)
-    store.remember("maybe", category="test", key="maybe", confidence=0.3)
+    store.remember("sure thing", category="test", key="sure", confidence=1.0, model="claude-opus-4-6")
+    store.remember("maybe", category="test", key="maybe", confidence=0.3, model="claude-opus-4-6")
 
     results = store.recall("thing maybe", min_confidence=0.5)
     assert all(r.confidence >= 0.5 for r in results)
 
 
 def test_get_context(store):
-    store.remember("user prefers dark mode", memory_type="preference", category="user")
-    store.remember("NAS IP is .192", category="network", key="nas_ip")
+    store.remember("user prefers dark mode", memory_type="preference", category="user", model="claude-opus-4-6")
+    store.remember("NAS IP is .192", category="network", key="nas_ip", model="claude-opus-4-6")
 
     ctx = store.get_context()
     assert len(ctx["preferences"]) >= 1
@@ -142,12 +165,62 @@ def test_get_context(store):
 
 
 def test_access_count_increments(store):
-    store.remember("accessed memory", category="test", key="accessed")
+    store.remember("accessed memory", category="test", key="accessed", model="claude-opus-4-6")
     store.recall("accessed memory")
     store.recall("accessed memory")
 
     m = store.recall("accessed memory")[0]
     assert m.access_count >= 2
+
+
+# ── Ownership / Permission Tests ──────────────────────────────
+
+
+def test_update_ownership(store):
+    """A model cannot update another model family's memory."""
+    m = store.remember("Claude's fact", category="test", key="owned", model="claude-opus-4-6")
+    with pytest.raises(PermissionError, match="Cannot update"):
+        store.update(m.id, content="Qwen overwrites", model="qwen3:32b")
+
+
+def test_update_same_family_allowed(store):
+    """Same model family (e.g. claude-opus and claude-sonnet) can update each other."""
+    m = store.remember("Opus wrote this", category="test", key="fam", model="claude-opus-4-6")
+    updated = store.update(m.id, content="Sonnet revised", model="claude-sonnet-4-6")
+    assert updated.content == "Sonnet revised"
+
+
+def test_forget_ownership(store):
+    """A model cannot forget another model family's memory."""
+    m = store.remember("Claude's fact", category="test", key="own_del", model="claude-opus-4-6")
+    with pytest.raises(PermissionError, match="Cannot forget"):
+        store.forget(m.id, model="qwen3:32b")
+
+
+def test_forget_same_family_allowed(store):
+    """Same model family can forget each other's memories."""
+    m = store.remember("Opus fact", category="test", key="fam_del", model="claude-opus-4-6")
+    assert store.forget(m.id, model="claude-sonnet-4-6")
+
+
+def test_forget_by_key_scoped_to_model(store):
+    """forget_by_key only deletes the caller's own fact, not other models'."""
+    store.remember("Claude's version", category="test", key="shared_key", model="claude-opus-4-6")
+    store.remember("Qwen's version", category="test", key="shared_key", model="qwen3:32b")
+
+    # Qwen forgets its own
+    assert store.forget_by_key("test", "shared_key", model="qwen3:32b")
+
+    # Claude's should still exist
+    results = store.recall("version", category="test")
+    assert len(results) == 1
+    assert results[0].model == "claude-opus-4-6"
+
+
+def test_forget_legacy_allowed(store):
+    """'legacy' model memories can be forgotten by anyone (legacy family matches legacy)."""
+    m = store.remember("old fact", category="test", key="leg", model="legacy")
+    assert store.forget(m.id, model="legacy")
 
 
 # ── Provenance / History Tests ──────────────────────────────────
@@ -181,48 +254,63 @@ def test_creation_recorded_in_history(store):
     assert history[0].context == "Testing history"
 
 
-def test_upsert_records_old_and_new_in_history(store):
-    """When two models write the same fact, history shows both perspectives."""
+def test_upsert_same_model_records_history(store):
+    """Same model writing same category+key records update in history."""
     store.remember(
         "The best approach is X",
         category="decisions",
         key="approach",
         model="claude-opus-4-6",
-        context="Based on analyzing logs, X handles the edge case better",
+        context="Based on analyzing logs",
+    )
+    store.remember(
+        "The best approach is X-prime",
+        category="decisions",
+        key="approach",
+        model="claude-opus-4-6",
+        context="Revised after more analysis",
+    )
+
+    results = store.recall("approach", category="decisions")
+    claude_results = [r for r in results if r.model == "claude-opus-4-6"]
+    assert len(claude_results) == 1
+    assert "X-prime" in claude_results[0].content
+
+    history = store.get_history(claude_results[0].id)
+    assert len(history) == 2
+    assert history[0].action == "created"
+    assert history[1].action == "updated"
+
+
+def test_cross_model_write_creates_separate_rows_with_history(store):
+    """Two different models writing same category+key: two rows, each with creation history."""
+    store.remember(
+        "The best approach is X",
+        category="decisions",
+        key="approach",
+        model="claude-opus-4-6",
+        context="Based on analyzing logs, X handles edge case better",
     )
     store.remember(
         "The best approach is Y",
         category="decisions",
         key="approach",
         model="qwen3:32b",
-        context="X has a performance bottleneck, Y avoids it entirely",
+        context="X has a performance bottleneck, Y avoids it",
     )
 
-    # Memory should have the latest value
     results = store.recall("approach", category="decisions")
-    assert len(results) == 1
-    assert "Y" in results[0].content
-    assert results[0].model == "qwen3:32b"
+    assert len(results) == 2
 
-    # History should show both perspectives
-    history = store.get_history(results[0].id)
-    assert len(history) == 2
-
-    # First entry: creation by Opus
-    assert history[0].action == "created"
-    assert history[0].model == "claude-opus-4-6"
-    assert "X" in history[0].new_content
-
-    # Second entry: update by Qwen, with old value preserved
-    assert history[1].action == "updated"
-    assert history[1].model == "qwen3:32b"
-    assert "X" in history[1].old_content
-    assert "Y" in history[1].new_content
-    assert "performance bottleneck" in history[1].context
+    # Each has its own history
+    for r in results:
+        history = store.get_history(r.id)
+        assert len(history) == 1
+        assert history[0].action == "created"
 
 
 def test_forget_records_history(store):
-    m = store.remember("obsolete fact", category="test", key="obsolete")
+    m = store.remember("obsolete fact", category="test", key="obsolete", model="claude-opus-4-6")
     store.forget(m.id, model="claude-opus-4-6", context="User confirmed this is no longer true")
 
     history = store.get_history(m.id)
@@ -234,7 +322,7 @@ def test_forget_records_history(store):
 
 
 def test_update_records_history(store):
-    m = store.remember("initial", category="test", key="upd")
+    m = store.remember("initial", category="test", key="upd", model="qwen3:32b")
     store.update(
         m.id,
         content="revised",
@@ -261,3 +349,280 @@ def test_get_history_by_model(store):
 
     qwen_history = store.get_history_by_model("qwen3:32b")
     assert len(qwen_history) == 1
+
+
+# ── Recall Scope Tests ──────────────────────────────────────────
+
+
+def test_recall_scope_own(store):
+    """recall(scope='own') returns only the caller's model family memories."""
+    store.remember("Claude knows X", category="test", key="cx", model="claude-opus-4-6")
+    store.remember("Qwen knows Y", category="test", key="qy", model="qwen3:32b")
+
+    result = store.recall("knows", caller_model="claude-opus-4-6", scope="own")
+    assert isinstance(result, RecallResult)
+    assert result.total >= 1
+    # Should only contain Claude memories
+    for m in result.all:
+        assert model_family(m.model) == "claude"
+
+
+def test_recall_scope_all_default(store):
+    """recall(scope='all') returns all memories (default)."""
+    store.remember("Claude knows X", category="test", key="cx", model="claude-opus-4-6")
+    store.remember("Qwen knows Y", category="test", key="qy", model="qwen3:32b")
+
+    result = store.recall("knows", caller_model="claude-opus-4-6", scope="all")
+    assert isinstance(result, RecallResult)
+    assert result.total >= 2
+
+
+# ── Vector / Hybrid Search Tests ──────────────────────────────
+
+
+def test_sqlite_vec_loaded(store):
+    """Verify sqlite-vec extension loads and vec_memories table exists."""
+    assert store._vec_available is True
+    row = store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE name = 'vec_memories'"
+    ).fetchone()
+    assert row is not None
+
+
+def test_rrf_fusion_basic():
+    """Test RRF fusion produces correct merged ranking."""
+    fts_ids = ["a", "b", "c"]
+    vec_ids = ["b", "d", "a"]
+    fused = MemoryStore._rrf_fuse(fts_ids, vec_ids, k=60)
+    scores = dict(fused)
+
+    # 'a' and 'b' appear in both lists — should have highest scores
+    assert scores["a"] > scores["c"]
+    assert scores["b"] > scores["d"]
+    # 'b' is rank 1 in FTS and rank 0 in vec — should be top or near top
+    assert scores["b"] >= scores["a"]
+
+
+def test_rrf_fusion_single_list():
+    """RRF with one empty list should still rank correctly."""
+    fts_ids = ["x", "y", "z"]
+    fused = MemoryStore._rrf_fuse(fts_ids, [], k=60)
+    ids = [mid for mid, _ in fused]
+    assert ids == ["x", "y", "z"]
+
+
+def test_embedding_stored_on_remember(store):
+    """When Ollama is available, remember() stores an embedding."""
+    m = store.remember("The NAS IP address is 192.168.0.192", category="network", key="nas_ip", model="claude-opus-4-6")
+    # Check if embedding was stored (may fail if Ollama is down — that's OK)
+    row = store._conn.execute(
+        "SELECT * FROM embeddings WHERE memory_id = ?", (m.id,)
+    ).fetchone()
+    # We can't assert row is not None because Ollama might not be running in CI
+    # But if it is stored, verify it has the right model
+    if row:
+        assert row["model"] == "nomic-embed-text"
+        assert len(row["embedding"]) == 768 * 4  # float32 = 4 bytes each
+
+
+def test_embedding_deleted_on_forget(store):
+    """Forgetting a memory cleans up its embedding."""
+    m = store.remember("temporary fact", category="temp", key="del_embed", model="claude-opus-4-6")
+    mid = m.id
+    store.forget(mid, model="claude-opus-4-6")
+    row = store._conn.execute(
+        "SELECT * FROM embeddings WHERE memory_id = ?", (mid,)
+    ).fetchone()
+    assert row is None
+    if store._vec_available:
+        vec_row = store._conn.execute(
+            "SELECT * FROM vec_memories WHERE memory_id = ?", (mid,)
+        ).fetchone()
+        assert vec_row is None
+
+
+def test_recall_fts_fallback_without_vectors(store):
+    """Recall still works via FTS when no embeddings exist."""
+    store.remember("Proxmox is the hypervisor host", category="infra", key="proxmox", model="claude-opus-4-6")
+    store.remember("TrueNAS runs as a VM on Proxmox", category="infra", key="truenas", model="claude-opus-4-6")
+    # Clear any embeddings to force FTS-only path
+    store._conn.execute("DELETE FROM embeddings")
+    if store._vec_available:
+        store._conn.execute("DELETE FROM vec_memories")
+    store._conn.commit()
+
+    results = store.recall("Proxmox hypervisor")
+    assert len(results) >= 1
+    assert any("Proxmox" in r.content for r in results)
+
+
+def test_backfill_embeddings(store):
+    """Backfill should embed memories that don't have vectors yet."""
+    store.remember("Memory one", category="test", key="bf1", model="claude-opus-4-6")
+    store.remember("Memory two", category="test", key="bf2", model="claude-opus-4-6")
+    # Clear embeddings to simulate pre-vector state
+    store._conn.execute("DELETE FROM embeddings")
+    if store._vec_available:
+        store._conn.execute("DELETE FROM vec_memories")
+    store._conn.commit()
+
+    result = store.backfill_embeddings(batch_size=10)
+    assert result["total"] >= 2
+    # If Ollama is running, embeddings should be created
+    # If not, they'll fail gracefully
+    assert result["embedded"] + result["failed"] >= 2
+
+
+def test_stats_includes_embedding_info(store):
+    """Stats should report embedding counts and model."""
+    store.remember("stats test", category="test", key="stats_embed", model="claude-opus-4-6")
+    s = store.stats()
+    assert "embedded_memories" in s
+    assert "embed_model" in s
+    assert s["embed_model"] == "nomic-embed-text"
+    assert "vec_search_available" in s
+
+
+# ── Model Fingerprinting / Provenance Tests ──────────────────
+
+
+def test_model_family():
+    """model_family() extracts the family prefix correctly."""
+    assert model_family("claude-opus-4-6") == "claude"
+    assert model_family("claude-sonnet-4-6") == "claude"
+    assert model_family("qwen3:32b") == "qwen3"
+    assert model_family("gemma") == "gemma"
+    assert model_family("gemini-2.5-pro") == "gemini"
+    assert model_family(None) is None
+    assert model_family("") is None
+
+
+def test_recall_with_caller_model_partitions(store):
+    """recall() with caller_model returns RecallResult partitioned by model family."""
+    store.remember("Claude knows X", category="test", key="cx", model="claude-opus-4-6")
+    store.remember("Qwen knows Y", category="test", key="qy", model="qwen3:32b")
+    store.remember("Legacy fact Z", category="test", key="uz", model="legacy")
+
+    result = store.recall("knows fact", caller_model="claude-sonnet-4-6")
+    assert isinstance(result, RecallResult)
+    assert result.total >= 3
+
+    own_contents = [m.content for m in result.own]
+    other_contents = [m.content for m in result.others]
+
+    assert any("Claude knows X" in c for c in own_contents)
+    assert any("Qwen knows Y" in c for c in other_contents)
+
+
+def test_recall_without_caller_model_backward_compat(store):
+    """recall() without caller_model returns list[Memory] (backward compat)."""
+    store.remember("backward compat test", category="test", key="bc", model="claude-opus-4-6")
+
+    result = store.recall("backward compat")
+    assert isinstance(result, list)
+    assert not isinstance(result, RecallResult)
+    assert len(result) >= 1
+
+
+def test_recall_result_all_preserves_score_order():
+    """RecallResult.all property returns all memories sorted by score descending."""
+    from engram.store import Memory
+
+    def _mem(score, model=None):
+        return Memory(
+            id="x", content="x", memory_type="fact", category="x", key=None,
+            tags=[], confidence=1.0, source=None, created_at="", updated_at="",
+            accessed_at="", access_count=0, model=model or "legacy", context=None, score=score,
+        )
+
+    rr = RecallResult(
+        own=[_mem(5.0, "claude-opus-4-6")],
+        others=[_mem(10.0, "qwen3:32b")],
+        unknown=[_mem(1.0)],
+    )
+    all_mems = rr.all
+    assert len(all_mems) == 3
+    assert all_mems[0].score == 10.0
+    assert all_mems[1].score == 5.0
+    assert all_mems[2].score == 1.0
+
+
+def test_get_context_with_caller_model_adds_provenance(store):
+    """get_context() with caller_model annotates dicts with provenance field."""
+    store.remember("user prefers vim", memory_type="preference", category="user", model="claude-opus-4-6")
+    store.remember("NAS at .192", category="network", key="nas_ip", model="qwen3:32b")
+    store.remember("Router at .1", category="network", key="router_ip", model="legacy")
+
+    ctx = store.get_context(caller_model="claude-opus-4-6")
+
+    # Preferences should have provenance
+    for p in ctx["preferences"]:
+        assert "provenance" in p
+    own_prefs = [p for p in ctx["preferences"] if p["provenance"] == "own"]
+    assert any("vim" in p["content"] for p in own_prefs)
+
+    # Recent facts should have provenance
+    for f in ctx["recent"]:
+        assert "provenance" in f
+    other_facts = [f for f in ctx["recent"] if f["provenance"] == "other"]
+    assert any(".192" in f["content"] for f in other_facts)
+
+
+# ── list_models / find_disagreements ──────────────────────────
+
+
+def test_list_models(store):
+    store.remember("fact A", category="test", key="a", model="claude-opus-4-6")
+    store.remember("fact B", category="test", key="b", model="qwen3:32b")
+    store.remember("fact C", category="test", key="c", model="claude-opus-4-6")
+
+    models = store.list_models()
+    assert len(models) == 2
+    model_names = {m["model"] for m in models}
+    assert "claude-opus-4-6" in model_names
+    assert "qwen3:32b" in model_names
+
+    claude = next(m for m in models if m["model"] == "claude-opus-4-6")
+    assert claude["count"] == 2
+
+
+def test_find_disagreements(store):
+    store.remember("X is best", category="decisions", key="approach", model="claude-opus-4-6")
+    store.remember("Y is best", category="decisions", key="approach", model="qwen3:32b")
+    store.remember("No disagreement here", category="test", key="solo", model="claude-opus-4-6")
+
+    disagreements = store.find_disagreements()
+    assert len(disagreements) == 1
+    assert disagreements[0]["category"] == "decisions"
+    assert disagreements[0]["key"] == "approach"
+    assert disagreements[0]["model_count"] == 2
+
+
+# ── Migration Tests ─────────────────────────────────────────────
+
+
+def test_migration_v2_schema_version(store):
+    """After init, schema_version table should exist with version 2."""
+    row = store._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    assert row[0] == 2
+
+
+def test_migration_v2_unique_constraint(store):
+    """UNIQUE(category, key, model) allows same category+key for different models."""
+    store.remember("v1", category="test", key="k", model="claude-opus-4-6")
+    store.remember("v2", category="test", key="k", model="qwen3:32b")
+    count = store._conn.execute(
+        "SELECT COUNT(*) FROM memories WHERE category='test' AND key='k'"
+    ).fetchone()[0]
+    assert count == 2
+
+
+def test_migration_v2_model_not_null(store):
+    """model column should be NOT NULL after migration."""
+    # Attempting to insert NULL model should fail
+    import sqlite3
+    with pytest.raises(sqlite3.IntegrityError):
+        store._conn.execute(
+            "INSERT INTO memories (id, content, memory_type, category, tags, created_at, updated_at, accessed_at, access_count, model) "
+            "VALUES ('xx', 'test', 'fact', 'test', '[]', '2025-01-01', '2025-01-01', '2025-01-01', 0, NULL)"
+        )

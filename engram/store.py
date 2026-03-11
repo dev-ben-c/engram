@@ -1,16 +1,20 @@
-"""SQLite + FTS5 memory store with relevance-ranked recall."""
+"""SQLite + FTS5 + vector memory store with hybrid retrieval."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import sqlite3
+import struct
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("engram")
 
 
 def _now() -> str:
@@ -19,6 +23,13 @@ def _now() -> str:
 
 def _short_id(content: str, salt: str = "") -> str:
     return hashlib.sha256(f"{content}{salt}{time.time_ns()}".encode()).hexdigest()[:12]
+
+
+def model_family(model: str | None) -> str | None:
+    """Extract model family: 'claude-opus-4-6' -> 'claude', 'qwen3:32b' -> 'qwen3'."""
+    if not model:
+        return None
+    return model.split(":")[0].split("-")[0]
 
 
 @dataclass
@@ -75,6 +86,24 @@ class Relationship:
         return asdict(self)
 
 
+@dataclass
+class RecallResult:
+    """Partitioned recall results for provenance-aware retrieval."""
+    own: list[Memory]       # caller's model family
+    others: list[Memory]    # different model family
+    unknown: list[Memory]   # no model recorded
+
+    @property
+    def all(self) -> list[Memory]:
+        combined = self.own + self.others + self.unknown
+        combined.sort(key=lambda m: m.score, reverse=True)
+        return combined
+
+    @property
+    def total(self) -> int:
+        return len(self.own) + len(self.others) + len(self.unknown)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
@@ -89,9 +118,9 @@ CREATE TABLE IF NOT EXISTS memories (
     updated_at TEXT NOT NULL,
     accessed_at TEXT NOT NULL,
     access_count INTEGER NOT NULL DEFAULT 0,
-    model TEXT,
+    model TEXT NOT NULL DEFAULT 'legacy',
     context TEXT,
-    UNIQUE(category, key)
+    UNIQUE(category, key, model)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
@@ -158,41 +187,313 @@ CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
 CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type);
 CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(category, key);
 CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(accessed_at);
+CREATE INDEX IF NOT EXISTS idx_memories_model ON memories(model);
 CREATE INDEX IF NOT EXISTS idx_relationships_from ON relationships(entity_from);
 CREATE INDEX IF NOT EXISTS idx_relationships_to ON relationships(entity_to);
 """
 
+EMBED_MODEL = "nomic-embed-text"
+EMBED_DIM = 768
+OLLAMA_URL = "http://localhost:11434/api/embed"
+
 
 class MemoryStore:
-    def __init__(self, db_path: str | Path | None = None):
+    def __init__(self, db_path: str | Path | None = None, ollama_url: str | None = None):
         if db_path is None:
             db_path = Path.home() / ".engram" / "memory.db"
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=10.0)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
+        self._conn.execute("PRAGMA busy_timeout=5000")
+        self._ollama_url = ollama_url or OLLAMA_URL
+        self._embed_client = None  # lazy httpx.Client
+        self._vec_available = self._load_sqlite_vec()
         self._init_schema()
+
+    def _load_sqlite_vec(self) -> bool:
+        """Load sqlite-vec extension. Returns True if available."""
+        try:
+            import sqlite_vec
+            self._conn.enable_load_extension(True)
+            sqlite_vec.load(self._conn)
+            self._conn.enable_load_extension(False)
+            return True
+        except (ImportError, Exception) as e:
+            logger.warning(f"sqlite-vec not available, vector search disabled: {e}")
+            return False
 
     def _init_schema(self):
         self._conn.executescript(SCHEMA)
         self._migrate()
+        if self._vec_available:
+            self._init_vec_table()
         self._conn.commit()
 
+    def _init_vec_table(self):
+        """Create the vec0 virtual table for KNN search if it doesn't exist."""
+        existing = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'vec_memories'"
+        ).fetchone()
+        if not existing:
+            try:
+                self._conn.execute(f"""
+                    CREATE VIRTUAL TABLE vec_memories USING vec0(
+                        memory_id TEXT PRIMARY KEY,
+                        embedding float[{EMBED_DIM}]
+                    )
+                """)
+            except sqlite3.OperationalError as e:
+                # Database locked by another process — will retry on next startup
+                logger.warning(f"Could not create vec_memories table (will retry on next startup): {e}")
+                self._vec_available = False
+
+    def _schema_version(self) -> int:
+        """Get current schema version (0 if no schema_version table)."""
+        try:
+            row = self._conn.execute(
+                "SELECT MAX(version) FROM schema_version"
+            ).fetchone()
+            return row[0] if row and row[0] else 0
+        except sqlite3.OperationalError:
+            return 0
+
     def _migrate(self):
-        """Add columns that may be missing from older schema versions."""
+        """Run schema migrations up to the latest version."""
+        # v0 → v1: add model and context columns (legacy migration)
         existing = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
-        migrations = [
-            ("model", "TEXT"),
-            ("context", "TEXT"),
-        ]
-        for col, col_type in migrations:
+        for col, col_type in [("model", "TEXT"), ("context", "TEXT")]:
             if col not in existing:
                 self._conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {col_type}")
 
+        version = self._schema_version()
+
+        if version < 2:
+            self._migrate_v2()
+
+    def _migrate_v2(self):
+        """v2: Per-model memory — UNIQUE(category, key, model), model NOT NULL."""
+        logger.info("Running schema migration v2: per-model memory partitioning")
+
+        # Disable FK checks during migration (table rebuild breaks FK references)
+        self._conn.execute("PRAGMA foreign_keys=OFF")
+
+        # 1. Create schema_version table
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                description TEXT
+            )
+        """)
+
+        # 2. Set model='legacy' on any NULL-model memories
+        self._conn.execute("UPDATE memories SET model = 'legacy' WHERE model IS NULL")
+
+        # 3. Rebuild memories table with new constraints
+        #    SQLite requires table rebuild for constraint changes
+        self._conn.execute("DROP TRIGGER IF EXISTS memories_ai")
+        self._conn.execute("DROP TRIGGER IF EXISTS memories_ad")
+        self._conn.execute("DROP TRIGGER IF EXISTS memories_au")
+
+        self._conn.execute("ALTER TABLE memories RENAME TO memories_old")
+
+        self._conn.execute("""
+            CREATE TABLE memories (
+                id TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                memory_type TEXT NOT NULL CHECK(memory_type IN ('fact', 'episode', 'preference')),
+                category TEXT NOT NULL DEFAULT 'general',
+                key TEXT,
+                tags TEXT NOT NULL DEFAULT '[]',
+                confidence REAL NOT NULL DEFAULT 1.0,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                accessed_at TEXT NOT NULL,
+                access_count INTEGER NOT NULL DEFAULT 0,
+                model TEXT NOT NULL DEFAULT 'legacy',
+                context TEXT,
+                UNIQUE(category, key, model)
+            )
+        """)
+
+        self._conn.execute("""
+            INSERT INTO memories
+            SELECT id, content, memory_type, category, key, tags, confidence,
+                   source, created_at, updated_at, accessed_at, access_count,
+                   COALESCE(model, 'legacy'), context
+            FROM memories_old
+        """)
+
+        self._conn.execute("DROP TABLE memories_old")
+
+        # 4. Rebuild FTS triggers
+        self._conn.execute("""
+            CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memories_fts(rowid, content, category, key, tags)
+                VALUES (new.rowid, new.content, new.category, new.key, new.tags);
+            END
+        """)
+        self._conn.execute("""
+            CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content, category, key, tags)
+                VALUES ('delete', old.rowid, old.content, old.category, old.key, old.tags);
+            END
+        """)
+        self._conn.execute("""
+            CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memories_fts(memories_fts, rowid, content, category, key, tags)
+                VALUES ('delete', old.rowid, old.content, old.category, old.key, old.tags);
+                INSERT INTO memories_fts(rowid, content, category, key, tags)
+                VALUES (new.rowid, new.content, new.category, new.key, new.tags);
+            END
+        """)
+
+        # 5. Rebuild FTS content to match new rowids
+        self._conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+
+        # 6. Rebuild indexes
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_key ON memories(category, key)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(accessed_at)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_model ON memories(model)")
+
+        # 7. Rebuild embeddings table to fix FK reference after table rebuild
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS embeddings_new (
+                memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+                embedding BLOB NOT NULL,
+                model TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        existing_embeds = self._conn.execute(
+            "SELECT name FROM sqlite_master WHERE name = 'embeddings'"
+        ).fetchone()
+        if existing_embeds:
+            self._conn.execute("INSERT OR IGNORE INTO embeddings_new SELECT * FROM embeddings")
+            self._conn.execute("DROP TABLE embeddings")
+        self._conn.execute("ALTER TABLE embeddings_new RENAME TO embeddings")
+
+        # 8. Record migration
+        self._conn.execute(
+            "INSERT INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+            (2, _now(), "Per-model memory partitioning: UNIQUE(category,key,model), model NOT NULL"),
+        )
+        self._conn.commit()
+
+        # Re-enable FK checks
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        logger.info("Schema migration v2 complete")
+
     def close(self):
+        if self._embed_client:
+            self._embed_client.close()
         self._conn.close()
+
+    # ── Embedding helpers ─────────────────────────────────────────
+
+    def _embed(self, text: str) -> list[float] | None:
+        """Generate embedding via Ollama. Returns None on failure."""
+        try:
+            import httpx
+        except ImportError:
+            return None
+        try:
+            if self._embed_client is None:
+                self._embed_client = httpx.Client(timeout=30.0)
+            resp = self._embed_client.post(
+                self._ollama_url,
+                json={"model": EMBED_MODEL, "input": text},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            # Ollama returns {"embeddings": [[...]]} for single input
+            embeddings = data.get("embeddings") or data.get("embedding")
+            if embeddings:
+                vec = embeddings[0] if isinstance(embeddings[0], list) else embeddings
+                if len(vec) == EMBED_DIM:
+                    return vec
+            return None
+        except Exception as e:
+            logger.debug(f"Embedding failed: {e}")
+            return None
+
+    def _serialize_vec(self, vec: list[float]) -> bytes:
+        """Serialize float list to little-endian f32 bytes for sqlite-vec."""
+        return struct.pack(f"<{len(vec)}f", *vec)
+
+    def _store_embedding(self, memory_id: str, vec: list[float]):
+        """Store embedding in both the embeddings table and vec_memories."""
+        now = _now()
+        blob = self._serialize_vec(vec)
+
+        # Upsert into embeddings table (metadata + raw blob)
+        self._conn.execute(
+            """INSERT INTO embeddings (memory_id, embedding, model, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(memory_id) DO UPDATE SET
+               embedding = excluded.embedding, model = excluded.model, created_at = excluded.created_at""",
+            (memory_id, blob, EMBED_MODEL, now),
+        )
+
+        # Upsert into vec_memories (KNN search table)
+        if self._vec_available:
+            # vec0 doesn't support ON CONFLICT — delete then insert
+            self._conn.execute("DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,))
+            self._conn.execute(
+                "INSERT INTO vec_memories (memory_id, embedding) VALUES (?, ?)",
+                (memory_id, blob),
+            )
+
+    def _embed_and_store(self, memory_id: str, content: str):
+        """Generate and store embedding for a memory. No-op on failure."""
+        vec = self._embed(content)
+        if vec:
+            self._store_embedding(memory_id, vec)
+            self._conn.commit()
+
+    def _delete_embedding(self, memory_id: str):
+        """Remove embedding for a deleted memory."""
+        self._conn.execute("DELETE FROM embeddings WHERE memory_id = ?", (memory_id,))
+        if self._vec_available:
+            self._conn.execute("DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,))
+
+    @staticmethod
+    def _rrf_fuse(
+        fts_ids: list[str],
+        vec_ids: list[str],
+        k: int = 60,
+    ) -> list[tuple[str, float]]:
+        """Reciprocal Rank Fusion of two ranked lists. Returns (id, score) sorted desc."""
+        scores: dict[str, float] = {}
+        for rank, mid in enumerate(fts_ids):
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+        for rank, mid in enumerate(vec_ids):
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
+        return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    def _vec_search(self, query: str, limit: int) -> list[str]:
+        """KNN vector search. Returns memory IDs ranked by similarity."""
+        if not self._vec_available:
+            return []
+        vec = self._embed(query)
+        if vec is None:
+            return []
+        blob = self._serialize_vec(vec)
+        try:
+            rows = self._conn.execute(
+                "SELECT memory_id, distance FROM vec_memories WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (blob, limit),
+            ).fetchall()
+            return [r["memory_id"] for r in rows]
+        except Exception as e:
+            logger.debug(f"Vector search failed: {e}")
+            return []
 
     # ── Remember ────────────────────────────────────────────────────
 
@@ -205,19 +506,19 @@ class MemoryStore:
         tags: list[str] | None = None,
         confidence: float = 1.0,
         source: str | None = None,
-        model: str | None = None,
+        model: str = "legacy",
         context: str | None = None,
     ) -> Memory:
-        """Store a new memory. If a fact with the same category+key exists, update it."""
+        """Store a new memory. If a fact with the same category+key+model exists, update it."""
         now = _now()
         tags = tags or []
         mid = _short_id(content)
 
         if key and memory_type == "fact":
-            # Upsert: update existing fact with same category+key
+            # Upsert: update existing fact with same category+key+model
             existing = self._conn.execute(
-                "SELECT * FROM memories WHERE category = ? AND key = ?",
-                (category, key),
+                "SELECT * FROM memories WHERE category = ? AND key = ? AND model = ?",
+                (category, key, model),
             ).fetchone()
             if existing:
                 # Record history before overwriting
@@ -240,6 +541,7 @@ class MemoryStore:
                      model, context, existing["id"]),
                 )
                 self._conn.commit()
+                self._embed_and_store(existing["id"], content)
                 return self._get_memory(existing["id"])
 
         try:
@@ -277,6 +579,7 @@ class MemoryStore:
             context=context,
         )
 
+        self._embed_and_store(mid, content)
         return self._get_memory(mid)
 
     # ── Recall ──────────────────────────────────────────────────────
@@ -289,11 +592,19 @@ class MemoryStore:
         tags: list[str] | None = None,
         limit: int = 10,
         min_confidence: float = 0.0,
-    ) -> list[Memory]:
-        """Search memories using FTS5 with relevance + recency + frequency scoring."""
-        # FTS5 search
-        fts_query = self._build_fts_query(query)
+        caller_model: str | None = None,
+        scope: str = "all",
+    ) -> list[Memory] | RecallResult:
+        """Hybrid search: FTS5 keyword + vector KNN, fused with RRF.
 
+        scope: "all" (default) returns all models' memories; "own" filters to caller's model family only.
+        """
+        overfetch = limit * 3
+        caller_fam = model_family(caller_model) if caller_model else None
+        scope_own = scope == "own" and caller_fam is not None
+
+        # ── Path A: FTS5 keyword search ──
+        fts_query = self._build_fts_query(query)
         sql = """
             SELECT m.*, fts.rank AS fts_rank
             FROM memories_fts fts
@@ -302,6 +613,9 @@ class MemoryStore:
         """
         params: list = [fts_query]
 
+        if scope_own:
+            sql += " AND m.model LIKE ?"
+            params.append(f"{caller_fam}%")
         if category:
             sql += " AND m.category = ?"
             params.append(category)
@@ -313,19 +627,75 @@ class MemoryStore:
             params.append(min_confidence)
 
         sql += " ORDER BY fts.rank LIMIT ?"
-        params.append(limit * 3)  # overfetch for re-ranking
+        params.append(overfetch)
 
-        rows = self._conn.execute(sql, params).fetchall()
-        memories = [self._row_to_memory(r) for r in rows]
+        fts_rows = self._conn.execute(sql, params).fetchall()
+        fts_ids = [r["id"] for r in fts_rows]
+
+        # ── Path B: Vector KNN search ──
+        vec_ids = self._vec_search(query, overfetch)
+
+        # Post-filter vec results for scope="own" (vec0 doesn't support WHERE)
+        if scope_own and vec_ids:
+            owned = set()
+            placeholders = ",".join("?" for _ in vec_ids)
+            rows = self._conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders}) AND model LIKE ?",
+                vec_ids + [f"{caller_fam}%"],
+            ).fetchall()
+            owned = {r["id"] for r in rows}
+            vec_ids = [mid for mid in vec_ids if mid in owned]
+
+        # ── Fusion ──
+        if vec_ids:
+            # RRF merge of both ranked lists
+            fused = self._rrf_fuse(fts_ids, vec_ids)
+            candidate_ids = [mid for mid, _ in fused]
+        else:
+            # Fallback: FTS-only (Ollama down or no embeddings)
+            candidate_ids = fts_ids
+
+        if not candidate_ids:
+            return []
+
+        # Fetch full Memory objects for candidates
+        placeholders = ",".join("?" for _ in candidate_ids)
+        filter_clauses = ""
+        filter_params: list = list(candidate_ids)
+        if category:
+            filter_clauses += " AND category = ?"
+            filter_params.append(category)
+        if memory_type:
+            filter_clauses += " AND memory_type = ?"
+            filter_params.append(memory_type)
+        if min_confidence > 0:
+            filter_clauses += " AND confidence >= ?"
+            filter_params.append(min_confidence)
+
+        rows = self._conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({placeholders}){filter_clauses}",
+            filter_params,
+        ).fetchall()
+        mem_by_id = {r["id"]: r for r in rows}
+
+        # Build ordered list preserving RRF/FTS rank
+        memories = []
+        for mid in candidate_ids:
+            if mid in mem_by_id:
+                memories.append(self._row_to_memory(mem_by_id[mid]))
 
         # Tag filter (post-query since tags are JSON)
         if tags:
             tag_set = set(tags)
             memories = [m for m in memories if tag_set & set(m.tags)]
 
-        # Re-rank with composite score
+        # Compute final scores: RRF rank is primary, composite is tiebreaker
+        rrf_scores = {mid: score for mid, score in fused} if vec_ids else {}
         for m in memories:
-            m.score = self._compute_score(m, rows)
+            composite = self._compute_score(m, fts_rows)
+            rrf = rrf_scores.get(m.id, 0.0)
+            # RRF dominates (scaled up); composite is tiebreaker
+            m.score = rrf * 100.0 + composite
 
         memories.sort(key=lambda m: m.score, reverse=True)
         memories = memories[:limit]
@@ -339,7 +709,19 @@ class MemoryStore:
             )
         self._conn.commit()
 
-        return memories
+        if caller_model is None:
+            return memories  # backward compat: flat list
+
+        own, others, unknown = [], [], []
+        for m in memories:
+            mem_fam = model_family(m.model)
+            if mem_fam is None:
+                unknown.append(m)
+            elif caller_fam and mem_fam == caller_fam:
+                own.append(m)
+            else:
+                others.append(m)
+        return RecallResult(own=own, others=others, unknown=unknown)
 
     def recall_by_id(self, memory_id: str) -> Memory | None:
         """Retrieve a specific memory by ID."""
@@ -356,11 +738,18 @@ class MemoryStore:
 
     # ── Forget ──────────────────────────────────────────────────────
 
-    def forget(self, memory_id: str, model: str | None = None, context: str | None = None) -> bool:
-        """Delete a memory by ID."""
+    def forget(self, memory_id: str, model: str = "legacy", context: str | None = None) -> bool:
+        """Delete a memory by ID. Model must own the memory."""
         existing = self._conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         if not existing:
             return False
+        existing_fam = model_family(existing["model"])
+        caller_fam = model_family(model)
+        if existing_fam and caller_fam and existing_fam != caller_fam:
+            raise PermissionError(
+                f"Cannot forget memory owned by {existing['model']} (family '{existing_fam}'). "
+                f"You are {model} (family '{caller_fam}'). Only the owning model family can forget."
+            )
         self._record_history(
             memory_id=memory_id,
             action="forgotten",
@@ -371,14 +760,15 @@ class MemoryStore:
             new_confidence=None,
             context=context,
         )
+        self._delete_embedding(memory_id)
         self._conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         self._conn.commit()
         return True
 
-    def forget_by_key(self, category: str, key: str, model: str | None = None, context: str | None = None) -> bool:
-        """Delete a fact by category + key."""
+    def forget_by_key(self, category: str, key: str, model: str = "legacy", context: str | None = None) -> bool:
+        """Delete a fact by category + key + model. Model-scoped."""
         existing = self._conn.execute(
-            "SELECT * FROM memories WHERE category = ? AND key = ?", (category, key)
+            "SELECT * FROM memories WHERE category = ? AND key = ? AND model = ?", (category, key, model)
         ).fetchone()
         if not existing:
             return False
@@ -392,7 +782,11 @@ class MemoryStore:
             new_confidence=None,
             context=context,
         )
-        self._conn.execute("DELETE FROM memories WHERE category = ? AND key = ?", (category, key))
+        self._delete_embedding(existing["id"])
+        self._conn.execute(
+            "DELETE FROM memories WHERE category = ? AND key = ? AND model = ?",
+            (category, key, model),
+        )
         self._conn.commit()
         return True
 
@@ -406,15 +800,22 @@ class MemoryStore:
         key: str | None = None,
         tags: list[str] | None = None,
         confidence: float | None = None,
-        model: str | None = None,
+        model: str = "legacy",
         context: str | None = None,
     ) -> Memory | None:
-        """Update fields of an existing memory."""
+        """Update fields of an existing memory. Model must own the memory."""
         existing = self._conn.execute(
             "SELECT * FROM memories WHERE id = ?", (memory_id,)
         ).fetchone()
         if not existing:
             return None
+        existing_fam = model_family(existing["model"])
+        caller_fam = model_family(model)
+        if existing_fam and caller_fam and existing_fam != caller_fam:
+            raise PermissionError(
+                f"Cannot update memory owned by {existing['model']} (family '{existing_fam}'). "
+                f"You are {model} (family '{caller_fam}'). Only the owning model family can update."
+            )
 
         # Record history
         self._record_history(
@@ -449,6 +850,11 @@ class MemoryStore:
         values = list(updates.values()) + [memory_id]
         self._conn.execute(f"UPDATE memories SET {set_clause} WHERE id = ?", values)
         self._conn.commit()
+
+        # Re-embed if content changed
+        if content is not None:
+            self._embed_and_store(memory_id, content)
+
         return self._get_memory(memory_id)
 
     # ── Relationships ───────────────────────────────────────────────
@@ -539,16 +945,53 @@ class MemoryStore:
         stale = self._conn.execute(
             "SELECT COUNT(*) FROM memories WHERE accessed_at < datetime('now', '-30 days')"
         ).fetchone()[0]
+        embedded = self._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+
+        by_model = self._conn.execute(
+            "SELECT model, COUNT(*) as count FROM memories GROUP BY model ORDER BY count DESC"
+        ).fetchall()
 
         return {
             "total_memories": total,
             "by_type": {r["memory_type"]: r["count"] for r in by_type},
+            "by_model": {r["model"]: r["count"] for r in by_model},
             "total_relationships": relationships,
             "oldest_memory": oldest,
             "newest_memory": newest,
             "stale_memories_30d": stale,
+            "embedded_memories": embedded,
+            "embed_model": EMBED_MODEL,
+            "vec_search_available": self._vec_available,
             "db_path": str(self.db_path),
         }
+
+    def list_models(self) -> list[dict]:
+        """List all models with memory counts and latest activity."""
+        rows = self._conn.execute("""
+            SELECT model, COUNT(*) as count,
+                   MAX(updated_at) as latest_update,
+                   MIN(created_at) as first_memory
+            FROM memories
+            GROUP BY model
+            ORDER BY count DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+    def find_disagreements(self) -> list[dict]:
+        """Find category+key pairs where multiple models have different memories.
+
+        Returns rows with category, key, model_count (number of distinct models).
+        """
+        rows = self._conn.execute("""
+            SELECT category, key, COUNT(DISTINCT model) as model_count,
+                   GROUP_CONCAT(model, ', ') as models
+            FROM memories
+            WHERE key IS NOT NULL
+            GROUP BY category, key
+            HAVING model_count > 1
+            ORDER BY model_count DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
 
     def get_stale(self, days: int = 30, limit: int = 20) -> list[Memory]:
         """Get memories not accessed in N days."""
@@ -560,27 +1003,101 @@ class MemoryStore:
         ).fetchall()
         return [self._row_to_memory(r) for r in rows]
 
+    # ── Backfill ─────────────────────────────────────────────────────
+
+    def backfill_embeddings(self, batch_size: int = 50) -> dict:
+        """Embed all memories that don't yet have vectors. Returns progress summary."""
+        # Find memories missing from vec_memories (or embeddings table if vec not available)
+        if self._vec_available:
+            rows = self._conn.execute(
+                """SELECT m.id, m.content FROM memories m
+                   LEFT JOIN vec_memories v ON m.id = v.memory_id
+                   WHERE v.memory_id IS NULL"""
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """SELECT m.id, m.content FROM memories m
+                   LEFT JOIN embeddings e ON m.id = e.memory_id
+                   WHERE e.memory_id IS NULL"""
+            ).fetchall()
+
+        total = len(rows)
+        embedded = 0
+        failed = 0
+        stale_model = 0
+
+        # Also find embeddings with a different model (stale)
+        stale_rows = self._conn.execute(
+            "SELECT memory_id FROM embeddings WHERE model != ?", (EMBED_MODEL,)
+        ).fetchall()
+        stale_ids = {r["memory_id"] for r in stale_rows}
+
+        # Re-embed stale ones too
+        if stale_ids:
+            stale_mem_rows = self._conn.execute(
+                f"SELECT id, content FROM memories WHERE id IN ({','.join('?' for _ in stale_ids)})",
+                list(stale_ids),
+            ).fetchall()
+            rows = list(rows) + list(stale_mem_rows)
+            stale_model = len(stale_ids)
+
+        for i in range(0, len(rows), batch_size):
+            batch = rows[i:i + batch_size]
+            for row in batch:
+                vec = self._embed(row["content"])
+                if vec:
+                    self._store_embedding(row["id"], vec)
+                    embedded += 1
+                else:
+                    failed += 1
+            self._conn.commit()
+
+        return {
+            "total": total + stale_model,
+            "embedded": embedded,
+            "failed": failed,
+            "stale_model_reembedded": min(stale_model, embedded),
+        }
+
     # ── Context (priming) ───────────────────────────────────────────
 
-    def get_context(self, topic: str | None = None, limit: int = 20) -> dict:
+    def get_context(self, topic: str | None = None, limit: int = 20, caller_model: str | None = None) -> dict:
         """Get a priming context for conversation start."""
         result = {"preferences": [], "recent": [], "topic_memories": []}
+        caller_fam = model_family(caller_model) if caller_model else None
+
+        def _annotate(mem_dict: dict) -> dict:
+            """Add provenance field when caller_model is provided."""
+            if caller_fam is None:
+                return mem_dict
+            mem_fam = model_family(mem_dict.get("model"))
+            if mem_fam is None:
+                mem_dict["provenance"] = "unknown"
+            elif mem_fam == caller_fam:
+                mem_dict["provenance"] = "own"
+            else:
+                mem_dict["provenance"] = "other"
+            return mem_dict
 
         # Always include preferences
         rows = self._conn.execute(
             "SELECT * FROM memories WHERE memory_type = 'preference' ORDER BY confidence DESC LIMIT 10"
         ).fetchall()
-        result["preferences"] = [self._row_to_memory(r).to_dict() for r in rows]
+        result["preferences"] = [_annotate(self._row_to_memory(r).to_dict()) for r in rows]
 
         # Recently updated facts
         rows = self._conn.execute(
             "SELECT * FROM memories WHERE memory_type = 'fact' ORDER BY updated_at DESC LIMIT 10"
         ).fetchall()
-        result["recent"] = [self._row_to_memory(r).to_dict() for r in rows]
+        result["recent"] = [_annotate(self._row_to_memory(r).to_dict()) for r in rows]
 
         # Topic-specific if provided
         if topic:
-            result["topic_memories"] = [m.to_dict() for m in self.recall(topic, limit=limit)]
+            memories = self.recall(topic, limit=limit, caller_model=caller_model)
+            if isinstance(memories, RecallResult):
+                result["topic_memories"] = [_annotate(m.to_dict()) for m in memories.all]
+            else:
+                result["topic_memories"] = [_annotate(m.to_dict()) for m in memories]
 
         return result
 

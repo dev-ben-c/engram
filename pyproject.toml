@@ -5,6 +5,7 @@ description = "Persistent memory system for LLMs — SQLite + FTS5 + vector sear
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.0.0",
+    "sqlite-vec>=0.1.0",
 ]
 
 [project.optional-dependencies]
