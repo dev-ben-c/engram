@@ -16,6 +16,13 @@ from typing import Optional
 
 logger = logging.getLogger("engram")
 
+# Duplicate detection: L2 distance threshold for same-model similarity check.
+# For normalized 768-dim embeddings, L2 < 0.4 ≈ cosine similarity > 0.92.
+DUPLICATE_DISTANCE_THRESHOLD = 0.4
+
+# ACT-R decay parameter (d ≈ 0.5 is standard in the literature).
+ACTR_DECAY = 0.5
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -84,6 +91,52 @@ class Relationship:
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+
+@dataclass
+class Challenge:
+    id: str
+    target_memory_id: str
+    challenger_model: str
+    status: str  # "open", "accepted", "rejected", "synthesized"
+    resolution: Optional[str]
+    resolved_by: Optional[str]
+    created_at: str
+    resolved_at: Optional[str]
+    arguments: list["ChallengeArgument"] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["arguments"] = [a.to_dict() for a in self.arguments]
+        return d
+
+
+@dataclass
+class ChallengeArgument:
+    id: str
+    challenge_id: str
+    model: str
+    position: str  # "challenge", "defense", "rebuttal", "synthesis"
+    argument: str
+    evidence: list[str]  # memory IDs cited
+    created_at: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+class DuplicateMemoryError(Exception):
+    """Raised when content is semantically similar to an existing same-model memory."""
+
+    def __init__(self, existing: "Memory", distance: float):
+        self.existing = existing
+        self.distance = distance
+        # Approximate cosine similarity from L2 distance (assumes normalized vectors)
+        self.similarity = max(0.0, 1.0 - distance**2 / 2.0)
+        super().__init__(
+            f"Similar memory already exists [{existing.id}] "
+            f"(~{self.similarity:.0%} similar). Use 'update' to modify it."
+        )
 
 
 @dataclass
@@ -190,6 +243,33 @@ CREATE INDEX IF NOT EXISTS idx_memories_accessed ON memories(accessed_at);
 CREATE INDEX IF NOT EXISTS idx_memories_model ON memories(model);
 CREATE INDEX IF NOT EXISTS idx_relationships_from ON relationships(entity_from);
 CREATE INDEX IF NOT EXISTS idx_relationships_to ON relationships(entity_to);
+
+CREATE TABLE IF NOT EXISTS challenges (
+    id TEXT PRIMARY KEY,
+    target_memory_id TEXT NOT NULL,
+    challenger_model TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open'
+        CHECK(status IN ('open', 'accepted', 'rejected', 'synthesized')),
+    resolution TEXT,
+    resolved_by TEXT,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS challenge_arguments (
+    id TEXT PRIMARY KEY,
+    challenge_id TEXT NOT NULL REFERENCES challenges(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    position TEXT NOT NULL
+        CHECK(position IN ('challenge', 'defense', 'rebuttal', 'synthesis')),
+    argument TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_challenges_target ON challenges(target_memory_id);
+CREATE INDEX IF NOT EXISTS idx_challenges_status ON challenges(status);
+CREATE INDEX IF NOT EXISTS idx_challenge_args_challenge ON challenge_arguments(challenge_id);
 """
 
 EMBED_MODEL = "nomic-embed-text"
@@ -272,6 +352,9 @@ class MemoryStore:
 
         if version < 2:
             self._migrate_v2()
+
+        if version < 3:
+            self._migrate_v3()
 
     def _migrate_v2(self):
         """v2: Per-model memory — UNIQUE(category, key, model), model NOT NULL."""
@@ -390,6 +473,26 @@ class MemoryStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         logger.info("Schema migration v2 complete")
 
+    def _migrate_v3(self):
+        """v3: Challenge/debate system — challenges + challenge_arguments tables."""
+        logger.info("Running schema migration v3: challenge/debate system")
+
+        # Tables are created by SCHEMA if they don't exist, but we still need
+        # to record the migration version for idempotency.
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL,
+                description TEXT
+            )
+        """)
+        self._conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+            (3, _now(), "Challenge/debate system: challenges + challenge_arguments tables"),
+        )
+        self._conn.commit()
+        logger.info("Schema migration v3 complete")
+
     def close(self):
         if self._embed_client:
             self._embed_client.close()
@@ -463,6 +566,52 @@ class MemoryStore:
         if self._vec_available:
             self._conn.execute("DELETE FROM vec_memories WHERE memory_id = ?", (memory_id,))
 
+    def _find_similar_same_model(
+        self, vec: list[float], model: str, threshold: float = DUPLICATE_DISTANCE_THRESHOLD
+    ) -> tuple["Memory", float] | None:
+        """Find the most similar memory from the same model family.
+
+        Returns (existing_memory, distance) if a near-duplicate exists, else None.
+        Only searches within the caller's model family — cross-model similarities are ignored.
+        """
+        if not self._vec_available:
+            return None
+        blob = self._serialize_vec(vec)
+        caller_fam = model_family(model)
+        if not caller_fam:
+            return None
+        try:
+            rows = self._conn.execute(
+                "SELECT memory_id, distance FROM vec_memories "
+                "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                (blob, 20),
+            ).fetchall()
+        except Exception as e:
+            logger.debug(f"Duplicate check vec search failed: {e}")
+            return None
+
+        for row in rows:
+            if row["distance"] >= threshold:
+                break  # sorted by distance ascending, no more matches possible
+            mem_row = self._conn.execute(
+                "SELECT model FROM memories WHERE id = ?", (row["memory_id"],)
+            ).fetchone()
+            if mem_row and model_family(mem_row["model"]) == caller_fam:
+                return (self._get_memory(row["memory_id"]), row["distance"])
+        return None
+
+    @staticmethod
+    def _activation(access_count: int, days_since_last_access: float, decay: float = ACTR_DECAY) -> float:
+        """ACT-R base-level activation: B_i ≈ ln(n+1) - d·ln(t+1).
+
+        Higher values = more active/remembered. Negative values = effectively forgotten.
+        - access_count: total number of times the memory has been retrieved
+        - days_since_last_access: days since last access (clamped to >= 0.001)
+        - decay: power-law decay rate (0.5 = standard ACT-R)
+        """
+        t = max(days_since_last_access, 0.001)
+        return math.log(access_count + 1) - decay * math.log(t + 1)
+
     @staticmethod
     def _rrf_fuse(
         fts_ids: list[str],
@@ -509,7 +658,11 @@ class MemoryStore:
         model: str = "legacy",
         context: str | None = None,
     ) -> Memory:
-        """Store a new memory. If a fact with the same category+key+model exists, update it."""
+        """Store a new memory. If a fact with the same category+key+model exists, update it.
+
+        Raises DuplicateMemoryError if a semantically similar memory from the same model
+        family already exists (facts and preferences only, not episodes).
+        """
         now = _now()
         tags = tags or []
         mid = _short_id(content)
@@ -543,6 +696,17 @@ class MemoryStore:
                 self._conn.commit()
                 self._embed_and_store(existing["id"], content)
                 return self._get_memory(existing["id"])
+
+        # Embed content early for duplicate detection
+        vec = self._embed(content)
+
+        # Duplicate detection: check for same-model semantic near-duplicates.
+        # Only for facts and preferences — episodes are unique events by definition.
+        # Skip for short content (<50 chars) — embeddings aren't discriminative enough.
+        if vec and self._vec_available and memory_type != "episode" and len(content) >= 50:
+            similar = self._find_similar_same_model(vec, model)
+            if similar:
+                raise DuplicateMemoryError(similar[0], similar[1])
 
         try:
             self._conn.execute(
@@ -579,7 +743,12 @@ class MemoryStore:
             context=context,
         )
 
-        self._embed_and_store(mid, content)
+        # Store embedding (reuse the one we already computed)
+        if vec:
+            self._store_embedding(mid, vec)
+            self._conn.commit()
+        else:
+            self._embed_and_store(mid, content)
         return self._get_memory(mid)
 
     # ── Recall ──────────────────────────────────────────────────────
@@ -994,14 +1163,202 @@ class MemoryStore:
         return [dict(r) for r in rows]
 
     def get_stale(self, days: int = 30, limit: int = 20) -> list[Memory]:
-        """Get memories not accessed in N days."""
+        """Get least-active memories using ACT-R power-law decay.
+
+        Pre-filters to memories not accessed in `days` days, then ranks by
+        activation score (lowest first = most forgotten). Activation uses:
+            B_i = ln(access_count + 1) - 0.5 * ln(days_since_last_access + 1)
+        """
         rows = self._conn.execute(
             """SELECT * FROM memories
-               WHERE accessed_at < datetime('now', ? || ' days')
-               ORDER BY accessed_at ASC LIMIT ?""",
-            (f"-{days}", limit),
+               WHERE accessed_at < datetime('now', ? || ' days')""",
+            (f"-{days}",),
         ).fetchall()
-        return [self._row_to_memory(r) for r in rows]
+        now = datetime.now(timezone.utc)
+        scored = []
+        for row in rows:
+            mem = self._row_to_memory(row)
+            try:
+                last_access = datetime.fromisoformat(mem.accessed_at)
+                days_since = max((now - last_access).total_seconds() / 86400, 0.001)
+            except (ValueError, TypeError):
+                days_since = 999.0
+            mem.score = self._activation(mem.access_count, days_since)
+            scored.append(mem)
+        scored.sort(key=lambda m: m.score)  # lowest activation = most stale
+        return scored[:limit]
+
+    # ── Challenges / Debate ────────────────────────────────────────
+
+    def challenge(
+        self,
+        target_memory_id: str,
+        model: str,
+        argument: str,
+        evidence: list[str] | None = None,
+    ) -> Challenge:
+        """Start a new challenge against an existing memory.
+
+        The challenger argues the target memory is wrong/incomplete and provides
+        their reasoning. Other models can then respond via debate().
+        """
+        # Verify target memory exists
+        target = self._conn.execute(
+            "SELECT * FROM memories WHERE id = ?", (target_memory_id,)
+        ).fetchone()
+        if not target:
+            raise ValueError(f"Target memory {target_memory_id} not found")
+
+        # Check for existing open challenge on this memory by this model family
+        caller_fam = model_family(model)
+        existing = self._conn.execute(
+            "SELECT c.* FROM challenges c WHERE c.target_memory_id = ? AND c.status = 'open'",
+            (target_memory_id,),
+        ).fetchall()
+        for row in existing:
+            if model_family(row["challenger_model"]) == caller_fam:
+                raise ValueError(
+                    f"Open challenge already exists from {row['challenger_model']} "
+                    f"on this memory [{row['id']}]. Use 'debate' to add arguments."
+                )
+
+        now = _now()
+        cid = _short_id(f"challenge:{target_memory_id}:{model}")
+        aid = _short_id(f"arg:{cid}:{model}")
+
+        self._conn.execute(
+            """INSERT INTO challenges (id, target_memory_id, challenger_model, status, created_at)
+               VALUES (?, ?, ?, 'open', ?)""",
+            (cid, target_memory_id, model, now),
+        )
+        self._conn.execute(
+            """INSERT INTO challenge_arguments (id, challenge_id, model, position, argument, evidence, created_at)
+               VALUES (?, ?, ?, 'challenge', ?, ?, ?)""",
+            (aid, cid, model, argument, json.dumps(evidence or []), now),
+        )
+        self._conn.commit()
+        return self._get_challenge(cid)
+
+    def debate(
+        self,
+        challenge_id: str,
+        model: str,
+        argument: str,
+        position: str = "rebuttal",
+        evidence: list[str] | None = None,
+    ) -> Challenge:
+        """Add an argument to an existing challenge. Any model can participate.
+
+        position: 'defense' (supports target memory), 'rebuttal' (supports challenger),
+                  'synthesis' (proposes a merged view).
+        """
+        challenge = self._conn.execute(
+            "SELECT * FROM challenges WHERE id = ?", (challenge_id,)
+        ).fetchone()
+        if not challenge:
+            raise ValueError(f"Challenge {challenge_id} not found")
+        if challenge["status"] != "open":
+            raise ValueError(f"Challenge {challenge_id} is already {challenge['status']}")
+        if position not in ("defense", "rebuttal", "synthesis"):
+            raise ValueError(f"Position must be 'defense', 'rebuttal', or 'synthesis'")
+
+        now = _now()
+        aid = _short_id(f"arg:{challenge_id}:{model}")
+
+        self._conn.execute(
+            """INSERT INTO challenge_arguments (id, challenge_id, model, position, argument, evidence, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (aid, challenge_id, model, position, argument, json.dumps(evidence or []), now),
+        )
+        self._conn.commit()
+        return self._get_challenge(challenge_id)
+
+    def get_challenges(
+        self,
+        status: str | None = "open",
+        target_memory_id: str | None = None,
+        limit: int = 20,
+    ) -> list[Challenge]:
+        """List challenges, optionally filtered by status and/or target memory."""
+        sql = "SELECT * FROM challenges WHERE 1=1"
+        params: list = []
+        if status:
+            sql += " AND status = ?"
+            params.append(status)
+        if target_memory_id:
+            sql += " AND target_memory_id = ?"
+            params.append(target_memory_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+
+        rows = self._conn.execute(sql, params).fetchall()
+        return [self._get_challenge(r["id"]) for r in rows]
+
+    def resolve_challenge(
+        self,
+        challenge_id: str,
+        status: str,
+        resolution: str,
+        resolved_by: str,
+    ) -> Challenge:
+        """Resolve a challenge.
+
+        status: 'accepted' (target was wrong), 'rejected' (challenge was wrong),
+                'synthesized' (both had partial truth — create a new memory with the merged view).
+        """
+        challenge = self._conn.execute(
+            "SELECT * FROM challenges WHERE id = ?", (challenge_id,)
+        ).fetchone()
+        if not challenge:
+            raise ValueError(f"Challenge {challenge_id} not found")
+        if challenge["status"] != "open":
+            raise ValueError(f"Challenge {challenge_id} is already {challenge['status']}")
+        if status not in ("accepted", "rejected", "synthesized"):
+            raise ValueError(f"Resolution status must be 'accepted', 'rejected', or 'synthesized'")
+
+        now = _now()
+        self._conn.execute(
+            "UPDATE challenges SET status = ?, resolution = ?, resolved_by = ?, resolved_at = ? WHERE id = ?",
+            (status, resolution, resolved_by, now, challenge_id),
+        )
+        self._conn.commit()
+        return self._get_challenge(challenge_id)
+
+    def _get_challenge(self, challenge_id: str) -> Challenge:
+        """Load a challenge with all its arguments."""
+        row = self._conn.execute(
+            "SELECT * FROM challenges WHERE id = ?", (challenge_id,)
+        ).fetchone()
+        if not row:
+            raise ValueError(f"Challenge {challenge_id} not found")
+
+        arg_rows = self._conn.execute(
+            "SELECT * FROM challenge_arguments WHERE challenge_id = ? ORDER BY created_at ASC",
+            (challenge_id,),
+        ).fetchall()
+        arguments = [
+            ChallengeArgument(
+                id=a["id"],
+                challenge_id=a["challenge_id"],
+                model=a["model"],
+                position=a["position"],
+                argument=a["argument"],
+                evidence=json.loads(a["evidence"]),
+                created_at=a["created_at"],
+            )
+            for a in arg_rows
+        ]
+        return Challenge(
+            id=row["id"],
+            target_memory_id=row["target_memory_id"],
+            challenger_model=row["challenger_model"],
+            status=row["status"],
+            resolution=row["resolution"],
+            resolved_by=row["resolved_by"],
+            created_at=row["created_at"],
+            resolved_at=row["resolved_at"],
+            arguments=arguments,
+        )
 
     # ── Backfill ─────────────────────────────────────────────────────
 

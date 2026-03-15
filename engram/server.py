@@ -11,7 +11,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
 
-from .store import MemoryStore, RecallResult
+from .store import MemoryStore, RecallResult, DuplicateMemoryError, Challenge
 
 logger = logging.getLogger("engram")
 
@@ -81,6 +81,19 @@ def _fmt_relationship(r) -> str:
     if r.metadata:
         line += f" {json.dumps(r.metadata)}"
     return line
+
+
+def _fmt_challenge(c: Challenge) -> str:
+    """Format a challenge with its arguments for display."""
+    parts = [f"[{c.id}] Challenge on memory {c.target_memory_id}"]
+    parts.append(f"  Status: {c.status} | Started by: {c.challenger_model} | {c.created_at}")
+    if c.resolution:
+        parts.append(f"  Resolution ({c.resolved_by}): {c.resolution}")
+    parts.append(f"  Arguments ({len(c.arguments)}):")
+    for a in c.arguments:
+        evidence_str = f" [cites: {', '.join(a.evidence)}]" if a.evidence else ""
+        parts.append(f"    [{a.position}] {a.model}: {a.argument}{evidence_str}")
+    return "\n".join(parts)
 
 
 @server.list_tools()
@@ -360,7 +373,9 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="get_stale",
-            description="Find memories not accessed in N days. Use for periodic cleanup.",
+            description="Find least-active memories using ACT-R power-law decay. "
+                        "Ranks by activation = ln(access_count+1) - 0.5·ln(days_since_access+1). "
+                        "Lowest activation = most forgotten. Pre-filters to memories not accessed in N days.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -407,6 +422,129 @@ async def list_tools() -> list[types.Tool]:
             ),
             inputSchema={"type": "object", "properties": {}},
         ),
+        types.Tool(
+            name="challenge",
+            description=(
+                "Start a debate about an existing memory. Challenge a memory you believe is "
+                "wrong, incomplete, or misleading. Provide your counter-argument and optionally "
+                "cite other memory IDs as evidence. Other models can then respond via 'debate'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "target_memory_id": {
+                        "type": "string",
+                        "description": "ID of the memory being challenged",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model making the challenge (self-identify)",
+                    },
+                    "argument": {
+                        "type": "string",
+                        "description": "Your counter-argument: why this memory is wrong/incomplete",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Memory IDs cited as supporting evidence",
+                    },
+                },
+                "required": ["target_memory_id", "model", "argument"],
+            },
+        ),
+        types.Tool(
+            name="debate",
+            description=(
+                "Add an argument to an existing challenge. Any model can participate. "
+                "Use position='defense' to support the target memory, 'rebuttal' to "
+                "support the challenger, or 'synthesis' to propose a merged view."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "challenge_id": {
+                        "type": "string",
+                        "description": "ID of the challenge to respond to",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model making the argument (self-identify)",
+                    },
+                    "argument": {
+                        "type": "string",
+                        "description": "Your argument",
+                    },
+                    "position": {
+                        "type": "string",
+                        "enum": ["defense", "rebuttal", "synthesis"],
+                        "default": "rebuttal",
+                        "description": "Your stance: defense (support target), rebuttal (support challenger), synthesis (merged view)",
+                    },
+                    "evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Memory IDs cited as supporting evidence",
+                    },
+                },
+                "required": ["challenge_id", "model", "argument"],
+            },
+        ),
+        types.Tool(
+            name="get_challenges",
+            description="List challenges/debates. Filter by status ('open', 'accepted', 'rejected', 'synthesized') or target memory.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "accepted", "rejected", "synthesized"],
+                        "default": "open",
+                        "description": "Filter by status (default: open)",
+                    },
+                    "target_memory_id": {
+                        "type": "string",
+                        "description": "Filter to challenges on a specific memory",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "default": 20,
+                    },
+                },
+            },
+        ),
+        types.Tool(
+            name="resolve_challenge",
+            description=(
+                "Resolve a challenge. 'accepted' = target memory was wrong (challenger wins), "
+                "'rejected' = challenge was wrong (target stands), 'synthesized' = both had "
+                "partial truth. Resolution does NOT auto-modify memories — use update/remember "
+                "separately to apply the conclusion."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "challenge_id": {
+                        "type": "string",
+                        "description": "ID of the challenge to resolve",
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Model (or 'user') resolving the challenge",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["accepted", "rejected", "synthesized"],
+                        "description": "Resolution: accepted (target wrong), rejected (challenge wrong), synthesized (merged)",
+                    },
+                    "resolution": {
+                        "type": "string",
+                        "description": "Explanation of the resolution and reasoning",
+                    },
+                },
+                "required": ["challenge_id", "model", "status", "resolution"],
+            },
+        ),
     ]
 
 
@@ -422,17 +560,25 @@ async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 
 def _dispatch(name: str, args: dict) -> str:
     if name == "remember":
-        m = store.remember(
-            content=args["content"],
-            memory_type=args.get("memory_type", "fact"),
-            category=args.get("category", "general"),
-            key=args.get("key"),
-            tags=args.get("tags"),
-            confidence=args.get("confidence", 1.0),
-            source=args.get("source"),
-            model=args["model"],
-            context=args.get("context"),
-        )
+        try:
+            m = store.remember(
+                content=args["content"],
+                memory_type=args.get("memory_type", "fact"),
+                category=args.get("category", "general"),
+                key=args.get("key"),
+                tags=args.get("tags"),
+                confidence=args.get("confidence", 1.0),
+                source=args.get("source"),
+                model=args["model"],
+                context=args.get("context"),
+            )
+        except DuplicateMemoryError as e:
+            return (
+                f"Duplicate detected (~{e.similarity:.0%} similar to existing memory). "
+                f"Not stored.\n\nExisting memory:\n{_fmt_memory(e.existing)}\n\n"
+                f"Use 'update' with memory_id={e.existing.id!r} to modify it, "
+                f"or use a different category/key if this is intentionally distinct."
+            )
         return f"Stored:\n{_fmt_memory(m)}"
 
     elif name == "recall":
@@ -600,9 +746,10 @@ def _dispatch(name: str, args: dict) -> str:
         )
         if not memories:
             return "No stale memories found."
-        lines = [f"Stale memories ({len(memories)}):\n"]
+        lines = [f"Stale memories ({len(memories)}), ranked by ACT-R activation (lowest = most forgotten):\n"]
         for m in memories:
-            lines.append(f"[{m.id}] ({m.category}) last accessed {m.accessed_at}")
+            lines.append(f"[{m.id}] ({m.category}) activation={m.score:.2f} "
+                         f"accessed={m.access_count}x last={m.accessed_at}")
             lines.append(f"  {m.content[:120]}")
             lines.append("")
         return "\n".join(lines)
@@ -631,6 +778,64 @@ def _dispatch(name: str, args: dict) -> str:
         for d in disagreements:
             lines.append(f"  {d['category']}/{d['key']}: {d['model_count']} models ({d['models']})")
         return "\n".join(lines)
+
+    elif name == "challenge":
+        try:
+            c = store.challenge(
+                target_memory_id=args["target_memory_id"],
+                model=args["model"],
+                argument=args["argument"],
+                evidence=args.get("evidence"),
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        # Also show the target memory for context
+        target = store.recall_by_id(args["target_memory_id"])
+        parts = ["Challenge created:\n"]
+        if target:
+            parts.append(f"Target memory:\n{_fmt_memory(target)}\n")
+        parts.append(_fmt_challenge(c))
+        return "\n".join(parts)
+
+    elif name == "debate":
+        try:
+            c = store.debate(
+                challenge_id=args["challenge_id"],
+                model=args["model"],
+                argument=args["argument"],
+                position=args.get("position", "rebuttal"),
+                evidence=args.get("evidence"),
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        return f"Argument added:\n\n{_fmt_challenge(c)}"
+
+    elif name == "get_challenges":
+        challenges = store.get_challenges(
+            status=args.get("status", "open"),
+            target_memory_id=args.get("target_memory_id"),
+            limit=args.get("limit", 20),
+        )
+        if not challenges:
+            status = args.get("status", "open")
+            return f"No {status} challenges found."
+        lines = [f"Found {len(challenges)} challenge(s):\n"]
+        for c in challenges:
+            lines.append(_fmt_challenge(c))
+            lines.append("")
+        return "\n".join(lines)
+
+    elif name == "resolve_challenge":
+        try:
+            c = store.resolve_challenge(
+                challenge_id=args["challenge_id"],
+                status=args["status"],
+                resolution=args["resolution"],
+                resolved_by=args["model"],
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+        return f"Challenge resolved:\n\n{_fmt_challenge(c)}"
 
     else:
         return f"Unknown tool: {name}"

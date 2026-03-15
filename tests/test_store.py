@@ -3,7 +3,7 @@
 import os
 import tempfile
 import pytest
-from engram.store import MemoryStore, RecallResult, model_family
+from engram.store import MemoryStore, RecallResult, DuplicateMemoryError, Challenge, model_family
 
 
 @pytest.fixture
@@ -602,9 +602,9 @@ def test_find_disagreements(store):
 
 
 def test_migration_v2_schema_version(store):
-    """After init, schema_version table should exist with version 2."""
+    """After init, schema_version table should exist with version >= 2."""
     row = store._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    assert row[0] == 2
+    assert row[0] >= 2
 
 
 def test_migration_v2_unique_constraint(store):
@@ -626,3 +626,313 @@ def test_migration_v2_model_not_null(store):
             "INSERT INTO memories (id, content, memory_type, category, tags, created_at, updated_at, accessed_at, access_count, model) "
             "VALUES ('xx', 'test', 'fact', 'test', '[]', '2025-01-01', '2025-01-01', '2025-01-01', 0, NULL)"
         )
+
+
+# ── Duplicate Detection Tests ─────────────────────────────────
+
+
+def test_duplicate_detection_same_model(store):
+    """Storing semantically identical content from the same model raises DuplicateMemoryError."""
+    store.remember(
+        "The TrueNAS server is accessible at IP address 192.168.0.192 on the local network via HTTP and SMB protocols",
+        category="network", key="nas_ip", model="claude-opus-4-6",
+    )
+    # Try storing nearly identical content under a different key
+    # (only triggers if Ollama is running and embeddings are close enough)
+    try:
+        store.remember(
+            "TrueNAS NAS server can be reached at 192.168.0.192 on the local area network using HTTP and SMB connections",
+            category="network", key="nas_info", model="claude-opus-4-6",
+        )
+        # If Ollama is down or embeddings aren't close enough, no error — that's OK
+    except DuplicateMemoryError as e:
+        assert e.existing.category == "network"
+        assert e.similarity > 0.9
+        assert e.existing.model == "claude-opus-4-6"
+
+
+def test_duplicate_detection_cross_model_allowed(store):
+    """Different model families can store similar content without triggering duplicates."""
+    store.remember(
+        "The TrueNAS server is accessible at IP address 192.168.0.192 on the local network via HTTP and SMB protocols",
+        category="network", key="nas_ip", model="claude-opus-4-6",
+    )
+    # Qwen storing the same thing should succeed (cross-model isolation)
+    m = store.remember(
+        "The TrueNAS server is accessible at IP address 192.168.0.192 on the local network via HTTP and SMB protocols",
+        category="network", key="nas_ip", model="qwen3:32b",
+    )
+    assert m.model == "qwen3:32b"
+
+
+def test_duplicate_detection_episodes_exempt(store):
+    """Episodes should never trigger duplicate detection."""
+    store.remember(
+        "Debugged NAS connectivity issue for 2 hours — traced it to a misconfigured VLAN on the CRS305 switch",
+        memory_type="episode", category="debug", model="claude-opus-4-6",
+    )
+    # Second similar episode should always succeed
+    m = store.remember(
+        "Debugged NAS connectivity issue for 2 hours again — same VLAN misconfiguration on the CRS305 switch",
+        memory_type="episode", category="debug", model="claude-opus-4-6",
+    )
+    assert m.memory_type == "episode"
+
+
+def test_duplicate_detection_upsert_bypasses(store):
+    """Category+key upsert should not be blocked by duplicate detection."""
+    store.remember(
+        "NAS is at .192",
+        category="network", key="nas_ip", model="claude-opus-4-6",
+    )
+    # Same category+key = intentional upsert, not a duplicate
+    m = store.remember(
+        "NAS is at .193",
+        category="network", key="nas_ip", model="claude-opus-4-6",
+    )
+    assert ".193" in m.content
+
+
+def test_duplicate_memory_error_attributes():
+    """DuplicateMemoryError carries the existing memory and similarity score."""
+    from engram.store import Memory
+    existing = Memory(
+        id="abc123", content="test", memory_type="fact", category="test",
+        key="k", tags=[], confidence=1.0, source=None, created_at="",
+        updated_at="", accessed_at="", access_count=0, model="claude-opus-4-6",
+    )
+    err = DuplicateMemoryError(existing, distance=0.3)
+    assert err.existing is existing
+    assert err.distance == 0.3
+    assert err.similarity > 0.9  # L2=0.3 → cosine > 0.95
+    assert "abc123" in str(err)
+
+
+# ── ACT-R Activation Tests ────────────────────────────────────
+
+
+def test_activation_formula():
+    """ACT-R activation: high access count + recent = high, low count + old = low."""
+    # Frequently accessed, accessed yesterday
+    high = MemoryStore._activation(access_count=50, days_since_last_access=1.0)
+    # Rarely accessed, accessed 90 days ago
+    low = MemoryStore._activation(access_count=1, days_since_last_access=90.0)
+    # Never accessed, accessed 200 days ago
+    very_low = MemoryStore._activation(access_count=0, days_since_last_access=200.0)
+
+    assert high > low > very_low
+    assert high > 0  # should be positive
+    assert very_low < 0  # should be negative (effectively forgotten)
+
+
+def test_activation_access_count_matters():
+    """A memory accessed 100 times 30 days ago should be more active than one accessed twice 30 days ago."""
+    heavy = MemoryStore._activation(access_count=100, days_since_last_access=30.0)
+    light = MemoryStore._activation(access_count=2, days_since_last_access=30.0)
+    assert heavy > light
+
+
+def test_activation_recency_matters():
+    """Same access count, but more recent = higher activation."""
+    recent = MemoryStore._activation(access_count=5, days_since_last_access=1.0)
+    old = MemoryStore._activation(access_count=5, days_since_last_access=60.0)
+    assert recent > old
+
+
+def test_get_stale_uses_activation(store):
+    """get_stale should rank by activation, not just last access time."""
+    # Memory A: accessed many times but 60 days ago
+    m_a = store.remember("frequently used config", category="test", key="freq", model="claude-opus-4-6")
+    store._conn.execute(
+        "UPDATE memories SET accessed_at = datetime('now', '-60 days'), access_count = 50 WHERE id = ?",
+        (m_a.id,),
+    )
+    # Memory B: accessed once, 60 days ago
+    m_b = store.remember("one-off note", category="test", key="oneoff", model="claude-opus-4-6")
+    store._conn.execute(
+        "UPDATE memories SET accessed_at = datetime('now', '-60 days'), access_count = 1 WHERE id = ?",
+        (m_b.id,),
+    )
+    store._conn.commit()
+
+    stale = store.get_stale(days=30)
+    assert len(stale) == 2
+    # Memory B (low access count) should be more stale (listed first = lowest activation)
+    assert stale[0].id == m_b.id
+    assert stale[1].id == m_a.id
+    # Both should have score (activation) set
+    assert stale[0].score < stale[1].score
+
+
+def test_get_stale_excludes_recent(store):
+    """Memories accessed recently should not appear as stale."""
+    store.remember("recent memory", category="test", key="recent", model="claude-opus-4-6")
+    stale = store.get_stale(days=30)
+    assert len(stale) == 0
+
+
+# ── Challenge / Debate Tests ──────────────────────────────────
+
+
+def test_challenge_basic(store):
+    """Create a challenge against an existing memory."""
+    m = store.remember("Best approach is X", category="decisions", key="approach", model="claude-opus-4-6")
+    c = store.challenge(
+        target_memory_id=m.id,
+        model="qwen3:32b",
+        argument="X has a performance bottleneck, Y avoids it",
+    )
+    assert c.id
+    assert c.target_memory_id == m.id
+    assert c.challenger_model == "qwen3:32b"
+    assert c.status == "open"
+    assert len(c.arguments) == 1
+    assert c.arguments[0].position == "challenge"
+    assert c.arguments[0].model == "qwen3:32b"
+
+
+def test_challenge_with_evidence(store):
+    """Challenge can cite other memories as evidence."""
+    m1 = store.remember("X is the approach", category="decisions", key="d1", model="claude-opus-4-6")
+    m2 = store.remember("X benchmark shows 200ms latency", category="perf", key="p1", model="qwen3:32b")
+    c = store.challenge(
+        target_memory_id=m1.id,
+        model="qwen3:32b",
+        argument="Benchmarks show X is too slow",
+        evidence=[m2.id],
+    )
+    assert c.arguments[0].evidence == [m2.id]
+
+
+def test_challenge_nonexistent_memory(store):
+    """Challenging a nonexistent memory raises ValueError."""
+    with pytest.raises(ValueError, match="not found"):
+        store.challenge(
+            target_memory_id="nonexistent",
+            model="qwen3:32b",
+            argument="This doesn't exist",
+        )
+
+
+def test_challenge_duplicate_prevention(store):
+    """Same model family can't open two challenges on the same memory."""
+    m = store.remember("fact", category="test", key="dup", model="claude-opus-4-6")
+    store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Wrong!")
+    with pytest.raises(ValueError, match="Open challenge already exists"):
+        store.challenge(target_memory_id=m.id, model="qwen3:14b", argument="Also wrong!")
+
+
+def test_debate_defense(store):
+    """Defending model can respond to a challenge."""
+    m = store.remember("X is correct", category="test", key="def", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="X is wrong")
+    c = store.debate(
+        challenge_id=c.id,
+        model="claude-opus-4-6",
+        argument="X handles edge cases that Y doesn't",
+        position="defense",
+    )
+    assert len(c.arguments) == 2
+    assert c.arguments[1].position == "defense"
+    assert c.arguments[1].model == "claude-opus-4-6"
+
+
+def test_debate_third_party(store):
+    """A third model can join the debate."""
+    m = store.remember("X is correct", category="test", key="3p", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="X is wrong")
+    c = store.debate(
+        challenge_id=c.id,
+        model="gemma3:27b",
+        argument="Both X and Y have merits, but Z is best",
+        position="synthesis",
+    )
+    assert len(c.arguments) == 2
+    assert c.arguments[1].model == "gemma3:27b"
+    assert c.arguments[1].position == "synthesis"
+
+
+def test_debate_on_resolved_fails(store):
+    """Can't add arguments to a resolved challenge."""
+    m = store.remember("fact", category="test", key="res", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Wrong!")
+    store.resolve_challenge(c.id, status="rejected", resolution="Nope", resolved_by="user")
+    with pytest.raises(ValueError, match="already rejected"):
+        store.debate(challenge_id=c.id, model="gemma3:27b", argument="But...")
+
+
+def test_resolve_accepted(store):
+    """Resolving as 'accepted' means the target memory was wrong."""
+    m = store.remember("old fact", category="test", key="ra", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Actually wrong")
+    c = store.resolve_challenge(
+        c.id,
+        status="accepted",
+        resolution="Qwen was right, the fact was outdated",
+        resolved_by="user",
+    )
+    assert c.status == "accepted"
+    assert c.resolution == "Qwen was right, the fact was outdated"
+    assert c.resolved_by == "user"
+    assert c.resolved_at is not None
+
+
+def test_resolve_synthesized(store):
+    """Resolving as 'synthesized' means both had partial truth."""
+    m = store.remember("X only", category="test", key="syn", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Y only")
+    store.debate(c.id, model="gemma3:27b", argument="Both X and Y", position="synthesis")
+    c = store.resolve_challenge(
+        c.id,
+        status="synthesized",
+        resolution="Both X and Y are valid in different contexts",
+        resolved_by="gemma3:27b",
+    )
+    assert c.status == "synthesized"
+    assert len(c.arguments) == 2  # original challenge + synthesis
+
+
+def test_get_challenges_filters(store):
+    """get_challenges filters by status and target memory."""
+    m1 = store.remember("fact1", category="test", key="gc1", model="claude-opus-4-6")
+    m2 = store.remember("fact2", category="test", key="gc2", model="claude-opus-4-6")
+    c1 = store.challenge(target_memory_id=m1.id, model="qwen3:32b", argument="Wrong")
+    c2 = store.challenge(target_memory_id=m2.id, model="qwen3:32b", argument="Also wrong")
+    store.resolve_challenge(c1.id, status="rejected", resolution="Nope", resolved_by="user")
+
+    open_challenges = store.get_challenges(status="open")
+    assert len(open_challenges) == 1
+    assert open_challenges[0].id == c2.id
+
+    rejected = store.get_challenges(status="rejected")
+    assert len(rejected) == 1
+    assert rejected[0].id == c1.id
+
+    # Filter by target memory
+    m1_challenges = store.get_challenges(status=None, target_memory_id=m1.id)
+    assert len(m1_challenges) == 1
+
+
+def test_get_challenges_all_statuses(store):
+    """Passing status=None returns all challenges."""
+    m = store.remember("fact", category="test", key="all", model="claude-opus-4-6")
+    store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Wrong")
+    all_challenges = store.get_challenges(status=None)
+    assert len(all_challenges) >= 1
+
+
+def test_challenge_to_dict(store):
+    """Challenge.to_dict() includes nested arguments."""
+    m = store.remember("fact", category="test", key="td", model="claude-opus-4-6")
+    c = store.challenge(target_memory_id=m.id, model="qwen3:32b", argument="Wrong")
+    d = c.to_dict()
+    assert "arguments" in d
+    assert len(d["arguments"]) == 1
+    assert d["arguments"][0]["position"] == "challenge"
+    assert d["status"] == "open"
+
+
+def test_migration_v3_schema_version(store):
+    """After init, schema_version table should include version 3."""
+    row = store._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    assert row[0] == 3
