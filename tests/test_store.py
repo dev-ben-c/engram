@@ -935,4 +935,90 @@ def test_challenge_to_dict(store):
 def test_migration_v3_schema_version(store):
     """After init, schema_version table should include version 3."""
     row = store._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
-    assert row[0] == 3
+    assert row[0] >= 3
+
+
+# ── Host field (v4) ──────────────────────────────────────────────
+
+
+def test_migration_v4_schema_version(store):
+    """After init, schema_version should be at least 4."""
+    row = store._conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+    assert row[0] >= 4
+
+
+def test_host_column_exists(store):
+    """The memories table should have a host column after v4."""
+    cols = {r[1] for r in store._conn.execute("PRAGMA table_info(memories)").fetchall()}
+    assert "host" in cols
+
+
+def test_remember_with_host(store):
+    """Storing a memory with a host persists the host field."""
+    m = store.remember(
+        "nvidia-smi shows both GPUs at idle",
+        category="gpu", key="idle_state", model="claude-opus-4-6", host="rabidllm",
+    )
+    assert m.host == "rabidllm"
+
+    got = store.recall_by_id(m.id)
+    assert got.host == "rabidllm"
+
+
+def test_remember_without_host(store):
+    """Storing without host leaves host NULL (host-agnostic)."""
+    m = store.remember(
+        "Python list comprehensions are faster than map()",
+        category="python", key="listcomp", model="claude-opus-4-6",
+    )
+    assert m.host is None
+
+
+def test_recall_host_filter(store):
+    """recall(host=X) returns memories for host X plus NULL-host memories, excludes other hosts."""
+    store.remember("rabidllm fact — 2x RTX 3090 installed", category="hw", key="gpu", model="claude-opus-4-6", host="rabidllm")
+    store.remember("pve fact — 1x RTX 4070 installed", category="hw", key="gpu4070", model="claude-opus-4-6", host="pve")
+    store.remember("universal fact — PCIe is backwards compatible", category="hw", key="pcie", model="claude-opus-4-6")
+
+    results = store.recall("fact", host="rabidllm")
+    contents = " ".join(r.content for r in results)
+    assert "RTX 3090" in contents
+    assert "RTX 4070" not in contents
+    # NULL-host (host-agnostic) memory should still be included
+    assert "PCIe is backwards compatible" in contents
+
+
+def test_recall_caller_host_boost(store):
+    """caller_host=X should rank host-X memories above host-Y memories for the same query."""
+    # Two memories about cooling on different hosts (distinct content so dedup doesn't merge)
+    store.remember(
+        "cooling fans running at 60 percent fan speed due to thermal load on rabidllm box",
+        category="gpu", key="fans_rabid", model="claude-opus-4-6", host="rabidllm",
+    )
+    store.remember(
+        "cooling fans spinning up to 70 percent fan speed from thermal throttle on pve box",
+        category="gpu", key="fans_pve", model="claude-opus-4-6", host="pve",
+    )
+
+    results = store.recall("cooling fans thermal", caller_host="rabidllm", limit=10)
+    assert len(results) >= 2
+    # Find the two relevant ones
+    rabid = next(r for r in results if r.host == "rabidllm")
+    pve = next(r for r in results if r.host == "pve")
+    assert rabid.score > pve.score
+
+
+def test_update_host(store):
+    """update(host=...) sets host on an existing memory."""
+    m = store.remember("some fact", category="x", key="y", model="claude-opus-4-6")
+    assert m.host is None
+    updated = store.update(memory_id=m.id, model="claude-opus-4-6", host="rabidllm")
+    assert updated.host == "rabidllm"
+
+
+def test_host_index_created(store):
+    """v4 migration should create idx_memories_host index."""
+    idx = store._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_host'"
+    ).fetchone()
+    assert idx is not None

@@ -55,6 +55,7 @@ class Memory:
     access_count: int
     model: Optional[str] = None  # which model created/last updated this
     context: Optional[str] = None  # reasoning/justification for the memory
+    host: Optional[str] = None  # hostname this memory applies to (NULL = host-agnostic)
     score: float = 0.0  # populated during recall
 
     def to_dict(self) -> dict:
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS memories (
     access_count INTEGER NOT NULL DEFAULT 0,
     model TEXT NOT NULL DEFAULT 'legacy',
     context TEXT,
+    host TEXT,
     UNIQUE(category, key, model)
 );
 
@@ -356,6 +358,9 @@ class MemoryStore:
         if version < 3:
             self._migrate_v3()
 
+        if version < 4:
+            self._migrate_v4()
+
     def _migrate_v2(self):
         """v2: Per-model memory — UNIQUE(category, key, model), model NOT NULL."""
         logger.info("Running schema migration v2: per-model memory partitioning")
@@ -492,6 +497,23 @@ class MemoryStore:
         )
         self._conn.commit()
         logger.info("Schema migration v3 complete")
+
+    def _migrate_v4(self):
+        """v4: Add host column to memories for per-system provenance."""
+        logger.info("Running schema migration v4: host column")
+
+        existing = {r[1] for r in self._conn.execute("PRAGMA table_info(memories)").fetchall()}
+        if "host" not in existing:
+            self._conn.execute("ALTER TABLE memories ADD COLUMN host TEXT")
+
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_host ON memories(host)")
+
+        self._conn.execute(
+            "INSERT OR IGNORE INTO schema_version (version, applied_at, description) VALUES (?, ?, ?)",
+            (4, _now(), "Add host column to memories for per-system provenance"),
+        )
+        self._conn.commit()
+        logger.info("Schema migration v4 complete")
 
     def close(self):
         if self._embed_client:
@@ -657,6 +679,7 @@ class MemoryStore:
         source: str | None = None,
         model: str = "legacy",
         context: str | None = None,
+        host: str | None = None,
     ) -> Memory:
         """Store a new memory. If a fact with the same category+key+model exists, update it.
 
@@ -688,10 +711,10 @@ class MemoryStore:
                 self._conn.execute(
                     """UPDATE memories SET content = ?, tags = ?, confidence = ?,
                        source = ?, updated_at = ?, accessed_at = ?,
-                       model = ?, context = ?
+                       model = ?, context = ?, host = ?
                        WHERE id = ?""",
                     (content, json.dumps(tags), confidence, source, now, now,
-                     model, context, existing["id"]),
+                     model, context, host, existing["id"]),
                 )
                 self._conn.commit()
                 self._embed_and_store(existing["id"], content)
@@ -712,10 +735,10 @@ class MemoryStore:
             self._conn.execute(
                 """INSERT INTO memories (id, content, memory_type, category, key, tags,
                    confidence, source, created_at, updated_at, accessed_at, access_count,
-                   model, context)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                   model, context, host)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
                 (mid, content, memory_type, category, key, json.dumps(tags),
-                 confidence, source, now, now, now, model, context),
+                 confidence, source, now, now, now, model, context, host),
             )
             self._conn.commit()
         except sqlite3.IntegrityError:
@@ -724,10 +747,10 @@ class MemoryStore:
             self._conn.execute(
                 """INSERT INTO memories (id, content, memory_type, category, key, tags,
                    confidence, source, created_at, updated_at, accessed_at, access_count,
-                   model, context)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                   model, context, host)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
                 (mid, content, memory_type, category, key, json.dumps(tags),
-                 confidence, source, now, now, now, model, context),
+                 confidence, source, now, now, now, model, context, host),
             )
             self._conn.commit()
 
@@ -763,10 +786,14 @@ class MemoryStore:
         min_confidence: float = 0.0,
         caller_model: str | None = None,
         scope: str = "all",
+        host: str | None = None,
+        caller_host: str | None = None,
     ) -> list[Memory] | RecallResult:
         """Hybrid search: FTS5 keyword + vector KNN, fused with RRF.
 
         scope: "all" (default) returns all models' memories; "own" filters to caller's model family only.
+        host: if provided, filter to memories with exactly this host (or NULL host — host-agnostic facts always included).
+        caller_host: if provided, boost memories matching this host and penalize mismatched hosts.
         """
         overfetch = limit * 3
         caller_fam = model_family(caller_model) if caller_model else None
@@ -794,6 +821,9 @@ class MemoryStore:
         if min_confidence > 0:
             sql += " AND m.confidence >= ?"
             params.append(min_confidence)
+        if host is not None:
+            sql += " AND (m.host = ? OR m.host IS NULL)"
+            params.append(host)
 
         sql += " ORDER BY fts.rank LIMIT ?"
         params.append(overfetch)
@@ -840,6 +870,9 @@ class MemoryStore:
         if min_confidence > 0:
             filter_clauses += " AND confidence >= ?"
             filter_params.append(min_confidence)
+        if host is not None:
+            filter_clauses += " AND (host = ? OR host IS NULL)"
+            filter_params.append(host)
 
         rows = self._conn.execute(
             f"SELECT * FROM memories WHERE id IN ({placeholders}){filter_clauses}",
@@ -865,6 +898,12 @@ class MemoryStore:
             rrf = rrf_scores.get(m.id, 0.0)
             # RRF dominates (scaled up); composite is tiebreaker
             m.score = rrf * 100.0 + composite
+            # Host-based provenance boost: match = +2.0, mismatch = -5.0, NULL = 0
+            if caller_host:
+                if m.host == caller_host:
+                    m.score += 2.0
+                elif m.host is not None:
+                    m.score -= 5.0
 
         memories.sort(key=lambda m: m.score, reverse=True)
         memories = memories[:limit]
@@ -971,6 +1010,7 @@ class MemoryStore:
         confidence: float | None = None,
         model: str = "legacy",
         context: str | None = None,
+        host: str | None = None,
     ) -> Memory | None:
         """Update fields of an existing memory. Model must own the memory."""
         existing = self._conn.execute(
@@ -1014,6 +1054,8 @@ class MemoryStore:
             updates["model"] = model
         if context is not None:
             updates["context"] = context
+        if host is not None:
+            updates["host"] = host
 
         set_clause = ", ".join(f"{k} = ?" for k in updates)
         values = list(updates.values()) + [memory_id]
@@ -1418,7 +1460,7 @@ class MemoryStore:
 
     # ── Context (priming) ───────────────────────────────────────────
 
-    def get_context(self, topic: str | None = None, limit: int = 20, caller_model: str | None = None) -> dict:
+    def get_context(self, topic: str | None = None, limit: int = 20, caller_model: str | None = None, caller_host: str | None = None) -> dict:
         """Get a priming context for conversation start."""
         result = {"preferences": [], "recent": [], "topic_memories": []}
         caller_fam = model_family(caller_model) if caller_model else None
@@ -1450,7 +1492,7 @@ class MemoryStore:
 
         # Topic-specific if provided
         if topic:
-            memories = self.recall(topic, limit=limit, caller_model=caller_model)
+            memories = self.recall(topic, limit=limit, caller_model=caller_model, caller_host=caller_host)
             if isinstance(memories, RecallResult):
                 result["topic_memories"] = [_annotate(m.to_dict()) for m in memories.all]
             else:
@@ -1540,6 +1582,7 @@ class MemoryStore:
             access_count=row["access_count"],
             model=row["model"],
             context=row["context"],
+            host=row["host"] if "host" in row.keys() else None,
         )
 
     def _row_to_relationship(self, row: sqlite3.Row) -> Relationship:

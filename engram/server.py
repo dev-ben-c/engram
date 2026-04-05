@@ -52,6 +52,8 @@ def _fmt_memory(m, provenance: str | None = None) -> str:
 
     if m.tags:
         parts.append(f"tags: {', '.join(m.tags)}")
+    if getattr(m, "host", None):
+        parts.append(f"host: {m.host}")
     parts.append(f"updated: {m.updated_at} | accessed: {m.accessed_at} ({m.access_count}x)")
     return "\n".join(parts)
 
@@ -151,6 +153,10 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Reasoning or justification for storing this memory. Explain WHY you concluded this.",
                     },
+                    "host": {
+                        "type": "string",
+                        "description": "Hostname this memory applies to (e.g. 'rabidllm', 'RabidNAS', 'pve'). Omit for host-agnostic facts. Use this when a fact is system-specific so it won't bleed across machines.",
+                    },
                 },
                 "required": ["content", "model"],
             },
@@ -200,6 +206,14 @@ async def list_tools() -> list[types.Tool]:
                         "default": "all",
                         "description": "Scope: 'all' (default) returns all models' memories; "
                                        "'own' filters to only your model family's memories.",
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "Filter to memories for this host (host-agnostic memories, with NULL host, are always included).",
+                    },
+                    "caller_host": {
+                        "type": "string",
+                        "description": "Your hostname (e.g. 'rabidllm'). When provided, memories matching this host are boosted in ranking and memories with a different host are penalized.",
                     },
                 },
                 "required": ["query"],
@@ -257,6 +271,10 @@ async def list_tools() -> list[types.Tool]:
                     "context": {
                         "type": "string",
                         "description": "Reasoning for the update — especially important if changing a conclusion",
+                    },
+                    "host": {
+                        "type": "string",
+                        "description": "Hostname this memory applies to. Set to bind a memory to a specific host, or omit to leave unchanged.",
                     },
                 },
                 "required": ["memory_id", "model"],
@@ -332,6 +350,10 @@ async def list_tools() -> list[types.Tool]:
                         "description": "Your model identifier (e.g., 'claude-opus-4-6'). "
                                        "When provided, memories are annotated with provenance "
                                        "(own/other/unknown) so you know their source.",
+                    },
+                    "caller_host": {
+                        "type": "string",
+                        "description": "Your hostname (e.g. 'rabidllm'). When provided, topic-specific memory ranking boosts host matches and penalizes mismatches.",
                     },
                 },
             },
@@ -571,6 +593,7 @@ def _dispatch(name: str, args: dict) -> str:
                 source=args.get("source"),
                 model=args["model"],
                 context=args.get("context"),
+                host=args.get("host"),
             )
         except DuplicateMemoryError as e:
             return (
@@ -590,6 +613,8 @@ def _dispatch(name: str, args: dict) -> str:
             limit=args.get("limit", 10),
             caller_model=args.get("caller_model"),
             scope=args.get("scope", "all"),
+            host=args.get("host"),
+            caller_host=args.get("caller_host"),
         )
         if isinstance(result, RecallResult):
             if result.total == 0:
@@ -641,6 +666,7 @@ def _dispatch(name: str, args: dict) -> str:
                 confidence=args.get("confidence"),
                 model=args["model"],
                 context=args.get("context"),
+                host=args.get("host"),
             )
         except PermissionError as e:
             return f"Permission denied: {e}"
@@ -680,6 +706,7 @@ def _dispatch(name: str, args: dict) -> str:
             topic=args.get("topic"),
             limit=args.get("limit", 20),
             caller_model=caller_model,
+            caller_host=args.get("caller_host"),
         )
         parts = []
         if ctx["preferences"]:
@@ -842,20 +869,71 @@ def _dispatch(name: str, args: dict) -> str:
 
 
 def main():
+    import argparse
     import asyncio
+
+    parser = argparse.ArgumentParser(description="Engram MCP server")
+    parser.add_argument(
+        "--transport", choices=["stdio", "sse"], default="stdio",
+        help="Transport mode: stdio (default) or sse (HTTP/SSE for remote access)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8093,
+        help="Port for SSE transport (default: 8093)",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Host to bind SSE server (default: 127.0.0.1)",
+    )
+    args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
     logger.info(f"Engram starting with DB at {DB_PATH}")
 
-    async def _run():
-        async with stdio_server() as (read_stream, write_stream):
-            await server.run(
-                read_stream,
-                write_stream,
-                server.create_initialization_options(),
-            )
+    if args.transport == "sse":
+        from starlette.applications import Starlette
+        from starlette.routing import Mount, Route
+        from starlette.requests import Request
+        from starlette.responses import JSONResponse
+        from mcp.server.sse import SseServerTransport
+        import uvicorn
 
-    asyncio.run(_run())
+        sse = SseServerTransport("/messages/")
+
+        async def handle_sse(request: Request):
+            async with sse.connect_sse(
+                request.scope, request.receive, request._send
+            ) as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+
+        async def health(request: Request):
+            return JSONResponse({"status": "ok", "db": DB_PATH})
+
+        app = Starlette(
+            routes=[
+                Route("/health", health),
+                Route("/sse", handle_sse),
+                Mount("/messages/", app=sse.handle_post_message),
+            ],
+        )
+
+        logger.info(f"Engram SSE server on {args.host}:{args.port}")
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+
+    else:
+        async def _run():
+            async with stdio_server() as (read_stream, write_stream):
+                await server.run(
+                    read_stream,
+                    write_stream,
+                    server.create_initialization_options(),
+                )
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":
