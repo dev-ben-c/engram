@@ -215,6 +215,21 @@ async def list_tools() -> list[types.Tool]:
                         "type": "string",
                         "description": "Your hostname (e.g. 'rabidllm'). When provided, memories matching this host are boosted in ranking and memories with a different host are penalized.",
                     },
+                    "before": {
+                        "type": "string",
+                        "description": "ISO 8601 date — only return memories created before this date. "
+                                       "Useful for temporal queries like 'what happened last week.'",
+                    },
+                    "after": {
+                        "type": "string",
+                        "description": "ISO 8601 date — only return memories created after this date.",
+                    },
+                    "min_similarity": {
+                        "type": "number",
+                        "description": "L2 distance threshold for abstention. If no memory is closer "
+                                       "than this threshold, returns empty results instead of irrelevant "
+                                       "matches. Lower = stricter. Typical range: 0.8 (strict) to 1.2 (lenient).",
+                    },
                 },
                 "required": ["query"],
             },
@@ -615,6 +630,9 @@ def _dispatch(name: str, args: dict) -> str:
             scope=args.get("scope", "all"),
             host=args.get("host"),
             caller_host=args.get("caller_host"),
+            before=args.get("before"),
+            after=args.get("after"),
+            min_similarity=args.get("min_similarity"),
         )
         if isinstance(result, RecallResult):
             if result.total == 0:

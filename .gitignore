@@ -6,3 +6,7 @@ __pycache__/
 dist/
 build/
 *.db
+
+# Benchmark datasets (large — download separately)
+benchmarks/longmemeval/longmemeval_*.json
+benchmarks/longmemeval/results/

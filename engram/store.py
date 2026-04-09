@@ -648,8 +648,11 @@ class MemoryStore:
             scores[mid] = scores.get(mid, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
-    def _vec_search(self, query: str, limit: int) -> list[str]:
-        """KNN vector search. Returns memory IDs ranked by similarity."""
+    def _vec_search(
+        self, query: str, limit: int,
+        before: str | None = None, after: str | None = None,
+    ) -> list[tuple[str, float]]:
+        """KNN vector search. Returns (memory_id, distance) pairs ranked by similarity."""
         if not self._vec_available:
             return []
         vec = self._embed(query)
@@ -657,14 +660,33 @@ class MemoryStore:
             return []
         blob = self._serialize_vec(vec)
         try:
+            # Overfetch if temporal filtering will remove some results
+            fetch_limit = limit * 3 if (before or after) else limit
             rows = self._conn.execute(
                 "SELECT memory_id, distance FROM vec_memories WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                (blob, limit),
+                (blob, fetch_limit),
             ).fetchall()
-            return [r["memory_id"] for r in rows]
+            results = [(r["memory_id"], r["distance"]) for r in rows]
         except Exception as e:
             logger.debug(f"Vector search failed: {e}")
             return []
+
+        # Post-filter by created_at if temporal bounds provided
+        if results and (before or after):
+            ids = [mid for mid, _ in results]
+            placeholders = ",".join("?" * len(ids))
+            filter_sql = f"SELECT id FROM memories WHERE id IN ({placeholders})"
+            filter_params: list = list(ids)
+            if after:
+                filter_sql += " AND created_at >= ?"
+                filter_params.append(after)
+            if before:
+                filter_sql += " AND created_at <= ?"
+                filter_params.append(before)
+            valid = {r["id"] for r in self._conn.execute(filter_sql, filter_params).fetchall()}
+            results = [(mid, dist) for mid, dist in results if mid in valid]
+
+        return results[:limit]
 
     # ── Remember ────────────────────────────────────────────────────
 
@@ -788,12 +810,19 @@ class MemoryStore:
         scope: str = "all",
         host: str | None = None,
         caller_host: str | None = None,
+        before: str | None = None,
+        after: str | None = None,
+        min_similarity: float | None = None,
     ) -> list[Memory] | RecallResult:
         """Hybrid search: FTS5 keyword + vector KNN, fused with RRF.
 
         scope: "all" (default) returns all models' memories; "own" filters to caller's model family only.
         host: if provided, filter to memories with exactly this host (or NULL host — host-agnostic facts always included).
         caller_host: if provided, boost memories matching this host and penalize mismatched hosts.
+        before: ISO 8601 date — only return memories created before this date.
+        after: ISO 8601 date — only return memories created after this date.
+        min_similarity: L2 distance threshold for abstention. If no memory is closer than
+            this threshold, returns empty results instead of irrelevant matches.
         """
         overfetch = limit * 3
         caller_fam = model_family(caller_model) if caller_model else None
@@ -824,6 +853,12 @@ class MemoryStore:
         if host is not None:
             sql += " AND (m.host = ? OR m.host IS NULL)"
             params.append(host)
+        if after:
+            sql += " AND m.created_at >= ?"
+            params.append(after)
+        if before:
+            sql += " AND m.created_at <= ?"
+            params.append(before)
 
         sql += " ORDER BY fts.rank LIMIT ?"
         params.append(overfetch)
@@ -832,7 +867,17 @@ class MemoryStore:
         fts_ids = [r["id"] for r in fts_rows]
 
         # ── Path B: Vector KNN search ──
-        vec_ids = self._vec_search(query, overfetch)
+        vec_results = self._vec_search(query, overfetch, before=before, after=after)
+        vec_ids = [vid for vid, _ in vec_results]
+        vec_distances = {vid: dist for vid, dist in vec_results}
+
+        # Abstention check: if best vector match is too distant, nothing relevant exists
+        if min_similarity is not None and vec_distances:
+            best_distance = min(vec_distances.values())
+            if best_distance > min_similarity:
+                if caller_model is not None:
+                    return RecallResult(own=[], others=[], unknown=[])
+                return []
 
         # Post-filter vec results for scope="own" (vec0 doesn't support WHERE)
         if scope_own and vec_ids:

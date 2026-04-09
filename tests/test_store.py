@@ -1022,3 +1022,93 @@ def test_host_index_created(store):
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_host'"
     ).fetchone()
     assert idx is not None
+
+
+# ── Temporal Filtering ─────────────────────────────────────────
+
+
+def test_recall_before_filter(store):
+    """before= should exclude memories created after the cutoff."""
+    # Insert with manually set created_at timestamps
+    store.remember("Event A happened", memory_type="episode", category="test", model="bench")
+    store._conn.execute(
+        "UPDATE memories SET created_at = '2026-01-15T00:00:00+00:00' WHERE content = 'Event A happened'"
+    )
+    store.remember("Event B happened", memory_type="episode", category="test", model="bench")
+    store._conn.execute(
+        "UPDATE memories SET created_at = '2026-03-15T00:00:00+00:00' WHERE content = 'Event B happened'"
+    )
+    store._conn.commit()
+
+    results = store.recall("Event", before="2026-02-01T00:00:00+00:00")
+    assert len(results) == 1
+    assert "Event A" in results[0].content
+
+
+def test_recall_after_filter(store):
+    """after= should exclude memories created before the cutoff."""
+    store.remember("Old event from January", memory_type="episode", category="test", model="bench")
+    store._conn.execute(
+        "UPDATE memories SET created_at = '2026-01-15T00:00:00+00:00' WHERE content LIKE 'Old event%'"
+    )
+    store.remember("New event from March", memory_type="episode", category="test", model="bench")
+    store._conn.execute(
+        "UPDATE memories SET created_at = '2026-03-15T00:00:00+00:00' WHERE content LIKE 'New event%'"
+    )
+    store._conn.commit()
+
+    results = store.recall("event", after="2026-02-01T00:00:00+00:00")
+    assert len(results) == 1
+    assert "March" in results[0].content
+
+
+def test_recall_temporal_range(store):
+    """Combining before + after should filter to a window."""
+    for month, label in [(1, "January"), (2, "February"), (3, "March"), (4, "April")]:
+        store.remember(f"Meeting in {label}", memory_type="episode", category="test", model="bench")
+        store._conn.execute(
+            f"UPDATE memories SET created_at = '2026-{month:02d}-15T00:00:00+00:00' WHERE content = 'Meeting in {label}'"
+        )
+    store._conn.commit()
+
+    results = store.recall(
+        "Meeting",
+        after="2026-02-01T00:00:00+00:00",
+        before="2026-03-31T00:00:00+00:00",
+    )
+    contents = [r.content for r in results]
+    assert any("February" in c for c in contents)
+    assert any("March" in c for c in contents)
+    assert not any("January" in c for c in contents)
+    assert not any("April" in c for c in contents)
+
+
+# ── Abstention Detection ──────────────────────────────────────
+
+
+def test_recall_abstention_returns_empty(store):
+    """min_similarity with a strict threshold should return empty for unrelated queries."""
+    store.remember("TrueNAS is at 192.168.0.192", category="network", key="nas", model="claude")
+    # Query something completely unrelated with a very strict threshold
+    results = store.recall("purple elephants dancing on mars", min_similarity=0.3)
+    assert results == []
+
+
+def test_recall_abstention_disabled_by_default(store):
+    """Without min_similarity, recall should always return something if memories exist."""
+    store.remember("TrueNAS is at 192.168.0.192", category="network", key="nas", model="claude")
+    results = store.recall("purple elephants dancing on mars")
+    # Should return something (even if irrelevant) since no threshold is set
+    assert len(results) >= 1
+
+
+def test_recall_abstention_with_caller_model(store):
+    """Abstention with caller_model should return empty RecallResult."""
+    store.remember("TrueNAS is at 192.168.0.192", category="network", key="nas", model="claude-opus-4-6")
+    result = store.recall(
+        "purple elephants dancing on mars",
+        caller_model="claude-opus-4-6",
+        min_similarity=0.3,
+    )
+    assert isinstance(result, RecallResult)
+    assert result.total == 0

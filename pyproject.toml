@@ -1,6 +1,6 @@
 [project]
 name = "engram"
-version = "0.1.0"
+version = "0.2.0"
 description = "Persistent memory system for LLMs — SQLite + FTS5 + vector search, exposed via MCP"
 requires-python = ">=3.11"
 dependencies = [
