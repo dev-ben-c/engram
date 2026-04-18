@@ -912,7 +912,7 @@ def main():
         from starlette.applications import Starlette
         from starlette.routing import Mount, Route
         from starlette.requests import Request
-        from starlette.responses import JSONResponse
+        from starlette.responses import JSONResponse, Response
         from mcp.server.sse import SseServerTransport
         import uvicorn
 
@@ -927,6 +927,7 @@ def main():
                     write_stream,
                     server.create_initialization_options(),
                 )
+            return Response()
 
         async def health(request: Request):
             return JSONResponse({"status": "ok", "db": DB_PATH})
